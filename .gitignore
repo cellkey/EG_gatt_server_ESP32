@@ -23,3 +23,37 @@ desktop.ini
 *.tmp
 *.bak
 
+# MD files
+MD_files/
+*.MD
+*.md
+
+# Arduino files
+Arduino_files/
+
+# Compiled binaries
+*.bin
+*.elf
+*.map
+
+# Test coverage
+htmlcov/
+.coverage
+coverage.xml
+*.cover
+
+# Documentation build outputs (if using Sphinx/Doxygen)
+docs/_build/
+docs/doxygen/
+
+# Python files
+*.py
+*.pyc
+*.pyo
+*.pyd
+*.pyw
+*.pyz
+*.pywz
+*.pyzw
+*.pyzwz
+*.pyzwzw
