@@ -1,6 +1,7 @@
-idf_component_register(SRCS "relay_control.c"
+idf_component_register(SRCS "ESP32C3_EG_code_notification.c"
+                       "relay_control.c"
                        "Encryption.c"
-                       "ESP32C3_EG_code_notification.c"
-                       "Encryption.h"
+                      
+                       "encryption.h"
                        PRIV_REQUIRES bt nvs_flash driver json
                        INCLUDE_DIRS ".")

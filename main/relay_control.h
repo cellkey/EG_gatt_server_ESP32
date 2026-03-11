@@ -6,20 +6,17 @@
 #include "esp_err.h"
 
 // Configuration
-#define MAX_RELAYS 2                    // Maximum number of latching relays supported
+// Uncomment to use non-latching relays (single control pin per relay)
+#define NON_LATCH
+// Uncomment if relay module is active-LOW (LOW = on, HIGH = off) - try if relays don't activate
+// #define RELAY_ACTIVE_LOW
+
+#define MAX_RELAYS 2                    // Maximum number of relays supported
 #define RELAY_QUEUE_SIZE 10             // Queue size for relay commands
 #define RELAY_TASK_STACK_SIZE 3072      // Stack size for relay task
 
-// Special command types
-typedef enum {
-    RELAY_CMD_NORMAL = 0,              // Normal timed/permanent relay control
-    RELAY_CMD_KEEP_OPEN,               // KEEP_OPEN: Activate both, reset relay1 after 2s, keep relay2 active
-    RELAY_CMD_KEEP_CLOSE               // KEEP_CLOSE: Reset relay2 (close system)
-} relay_command_type_t;
-
 // Relay command structure
 typedef struct {
-    relay_command_type_t cmd_type;      // Command type (normal, keep_open, keep_close)
     uint8_t relay_number;               // Relay number: 1=relay1, 2=relay2, 3=both relays
     uint32_t duration_ms;               // Duration in milliseconds (0 = toggle permanently, max 15000ms)
     bool activate;                      // true = activate, false = deactivate
@@ -73,38 +70,16 @@ esp_err_t relay_get_status(uint8_t relay_number, relay_status_t *status);
  * @return ESP_OK on success, error code on failure
  */
 esp_err_t relay_emergency_stop(void);
+
 /**
  * @brief Parse relay command from JSON message
- * Formats: 
- * - Normal: {"e":["F0EZKTE"],"g":[3,7]}# (relay 3, 7 seconds)
- * - KEEP_OPEN: {"e":["F0EZKTE"],"g":["KEEP_OPEN"]}# (activate both, reset relay1 after 2s)
- * - KEEP_CLOSE: {"e":["F0EZKTE"],"g":["KEEP_CLOSE"]}# (reset relay2, close system)
- * 
+ * Format: {"e":["F0EZKTE"],"r":[X],"g":[Y,Z]}
+ * - r[0]: Relay number (1=relay1, 2=relay2, 3=both relays)
+ * - g[1]: Duration in seconds (1-15 seconds max)
  * @param json_message JSON string containing relay command
  * @param cmd Pointer to command structure to fill
  * @return ESP_OK on success, error code on failure
  */
-esp_err_t parse_json_command(const char *json_message, relay_command_t *cmd);
-
-/**
- * @brief Process command from BLE source (current implementation)
- * Handles BLE-specific message validation and processing
- * 
- * @param message_buffer Complete BLE message buffer
- * @param cmd Pointer to command structure to fill
- * @return ESP_OK on success, error code on failure
- */
-esp_err_t process_ble_command(const char *message_buffer, relay_command_t *cmd);
-
-/**
- * @brief Process command from UART/Cellular source (future implementation)
- * Handles UART-specific framing, validation and processing
- * 
- * @param uart_data Raw UART data from cellular modem
- * @param data_len Length of UART data
- * @param cmd Pointer to command structure to fill
- * @return ESP_OK on success, error code on failure
- */
-esp_err_t process_uart_command(const uint8_t *uart_data, size_t data_len, relay_command_t *cmd);
+esp_err_t relay_parse_command_from_json(const char *json_message, relay_command_t *cmd);
 
 #endif // RELAY_CONTROL_H

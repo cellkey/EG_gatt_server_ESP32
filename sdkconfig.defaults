@@ -6,3 +6,7 @@ CONFIG_BT_ENABLED=y
 CONFIG_BT_BLE_42_FEATURES_SUPPORTED=y
 # CONFIG_BT_LE_50_FEATURE_SUPPORT is not used on ESP32, ESP32-C3 and ESP32-S3.
 # CONFIG_BT_LE_50_FEATURE_SUPPORT is not set
+# Disable Task WDT to avoid reset loop at startup (BLE/dual-core ESP32 can starve idle)
+CONFIG_ESP_TASK_WDT_EN=n
+# Disable Interrupt WDT entirely (BLE/dual-core can trigger TG1WDT; re-enable for production if needed)
+CONFIG_ESP_INT_WDT=n
