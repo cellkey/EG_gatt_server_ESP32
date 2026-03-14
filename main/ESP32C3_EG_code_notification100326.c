@@ -12,7 +12,6 @@ Eli - Continuas relay activation. Led blinks while relay is active.
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
-#include "freertos/semphr.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "esp_log.h"
@@ -36,12 +35,6 @@ Eli - Continuas relay activation. Led blinks while relay is active.
 /* #efine LED_GPIO       21 //  //Eli board configuration */
 
 #define LED_BLINK_MS     500
-
-// App does not require per-command ACK notifications
-#define SEND_ACK_NOTIFICATIONS 0
-
-// Disable per-fragment RX logging (too noisy)
-#define LOG_RX_FRAGMENTS 0
 
 // Relay system initialization flag
 static bool relay_system_initialized = false;
@@ -75,6 +68,7 @@ static uint16_t char2_handle;  // FFE2
  unsigned long rnd, *rnd_ptr;
  char encrypted[16]; 
 
+#define MAX_DATA_LEN  50
 #define MSG_BUF_LEN 64
 
 #define NOTIFICATION_QUEUE_SIZE 10
@@ -95,21 +89,15 @@ static QueueHandle_t notification_queue = NULL;
 static TaskHandle_t notification_task_handle = NULL;
 static bool notification_task_running = false;
 
-// RX framing: if no '#' terminator arrives, finalize message after this silence window (ms).
-// Stored in NVS (unit_config/rx_silence_ms). Set to 0 to disable and use only '#'.
-static uint16_t rx_silence_ms = 70;
-static SemaphoreHandle_t rx_buf_mutex = NULL;
-static TaskHandle_t rx_finalize_task_handle = NULL;
-static TimerHandle_t rx_silence_timer = NULL;
-
 // Connection timeout management
 static TaskHandle_t connection_timeout_task_handle = NULL;
 static bool connection_timeout_running = false;
 static bool message_received_flag = false;
 
 
-// Relay command storage for parsing/execution
+// Relay command storage for post-disconnect processing
 static relay_command_t pending_relay_cmd = {0};
+static bool relay_cmd_pending = false;
 
 // Unit ID management (NVS-based configuration)
 #define UNIT_ID_MAX_LEN 16
@@ -137,6 +125,7 @@ static TaskHandle_t status_led_task_handle = NULL;
 static TickType_t last_led_toggle_tick = 0;    // For status LED blink when advertising
 static bool led_state = false;                 // Current LED on/off state
 
+static uint8_t received_data[MAX_DATA_LEN + 1];  // +1 for null-terminator
 static uint16_t conn_id = 0;
 static bool is_connected = false;
 static esp_gatt_if_t gatt_if_for_send = 0;
@@ -358,66 +347,7 @@ static void load_prog_version(void)
     // If not present (or read failed), ensure we have a defined default in NVS too.
     write_prog_version_to_nvs(prog_version);
 }
-//////////////////////new 110326//////////////////
-static esp_err_t read_rx_silence_ms_from_nvs(uint16_t *out_value)
-{
-    if (!out_value) return ESP_ERR_INVALID_ARG;
 
-    nvs_handle_t nvs_handle;
-    esp_err_t err = nvs_open("unit_config", NVS_READONLY, &nvs_handle);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to open NVS for reading rx_silence_ms: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    err = nvs_get_u16(nvs_handle, "rx_silence_ms", out_value);
-    nvs_close(nvs_handle);
-
-    if (err == ESP_OK) {
-        ESP_LOGI(TAG, "rx_silence_ms loaded from NVS: %u", (unsigned)*out_value);
-    } else if (err == ESP_ERR_NVS_NOT_FOUND) {
-        ESP_LOGW(TAG, "rx_silence_ms not found in NVS, using default %u", (unsigned)rx_silence_ms);
-    } else {
-        ESP_LOGE(TAG, "Error reading rx_silence_ms: %s", esp_err_to_name(err));
-    }
-
-    return err;
-}
-
-static esp_err_t write_rx_silence_ms_to_nvs(uint16_t value)
-{
-    nvs_handle_t nvs_handle;
-    esp_err_t err = nvs_open("unit_config", NVS_READWRITE, &nvs_handle);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to open NVS for writing rx_silence_ms: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    err = nvs_set_u16(nvs_handle, "rx_silence_ms", value);
-    if (err == ESP_OK) {
-        err = nvs_commit(nvs_handle);
-        if (err == ESP_OK) {
-            rx_silence_ms = value;
-            ESP_LOGI(TAG, "rx_silence_ms saved to NVS: %u", (unsigned)rx_silence_ms);
-        }
-    }
-
-    nvs_close(nvs_handle);
-    return err;
-}
-
-static void load_rx_silence_ms(void)
-{
-    uint16_t v = 0;
-    if (read_rx_silence_ms_from_nvs(&v) == ESP_OK) {
-        rx_silence_ms = v;
-        return;
-    }
-
-    // If not present (or read failed), ensure we have a defined default in NVS too.
-    write_rx_silence_ms_to_nvs(rx_silence_ms);
-}
-/////////////////end of new/////////////////////////////////////
 static char *skip_spaces(char *s)
 {
     while (s && *s && isspace((unsigned char)*s)) s++;
@@ -665,10 +595,20 @@ esp_err_t stop_connection_timeout(void)
     }
 
     connection_timeout_running = false;
+    
+    // Wait for task to finish
+    uint32_t timeout_ms = 500;
+    uint32_t elapsed = 0;
+    while (connection_timeout_task_handle != NULL && elapsed < timeout_ms) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+        elapsed += 10;
+    }
 
-    // Do not block here (this is called from BLE callback paths). Just stop promptly.
-    vTaskDelete(connection_timeout_task_handle);
-    connection_timeout_task_handle = NULL;
+    if (connection_timeout_task_handle != NULL) {
+      //  ESP_LOGW(TAG, "Force deleting connection timeout task");
+        vTaskDelete(connection_timeout_task_handle);
+        connection_timeout_task_handle = NULL;
+    }
 
     connection_timeout_running = false;
   //  ESP_LOGI(TAG, "Connection timeout monitoring stopped");
@@ -709,80 +649,7 @@ esp_err_t ble_send_notification(const char* message, bool is_response)
    // ESP_LOGI(TAG, "Queued notification: %s", message);
     return ESP_OK;
 }
-//////////////new 110326//////////////////////////////////////
-static void rx_finalize_task(void *arg)
-{
-    (void)arg;
-    char local[MSG_BUF_LEN] = {0};
 
-    while (1) {
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-
-        if (rx_buf_mutex) {
-            xSemaphoreTake(rx_buf_mutex, portMAX_DELAY);
-        }
-
-        int len = message_index;
-        if (len > 0) {
-            if (len >= (int)sizeof(local)) len = (int)sizeof(local) - 1;
-            memcpy(local, message_buffer, len);
-            local[len] = '\0';
-
-            // Clear shared buffer so new fragments can accumulate
-            message_index = 0;
-            memset(message_buffer, 0, MSG_BUF_LEN);
-        } else {
-            local[0] = '\0';
-        }
-
-        if (rx_buf_mutex) {
-            xSemaphoreGive(rx_buf_mutex);
-        }
-
-        if (local[0] == '\0') {
-            continue;
-        }
-
-        // Treat as complete message due to silence (ATMEGA-style framing)
-        message_received_flag = true;
-        stop_connection_timeout();
-
-        ESP_LOGI(TAG, "RX silence finalize (%u ms): %s", (unsigned)rx_silence_ms, local);
-
-        if (strstr(local, encrypted_data) != NULL) {
-            ESP_LOGI(TAG, "Authorized Message received (silence framed)");
-
-            esp_err_t parse_result = relay_parse_command_from_json(local, &pending_relay_cmd);
-            if (parse_result == ESP_OK) {
-                ESP_LOGI(TAG, "Relay command parsed successfully - activating relays now");
-                esp_err_t exec_result = relay_execute_command(&pending_relay_cmd);
-                if (exec_result == ESP_OK) {
-                    ESP_LOGI(TAG, "Relay command executed successfully");
-                } else {
-                    ESP_LOGE(TAG, "Failed to execute relay command: %s", esp_err_to_name(exec_result));
-                }
-            } else {
-                ESP_LOGW(TAG, "Failed to parse relay command: %s", esp_err_to_name(parse_result));
-            }
-
-            if (is_connected) {
-                ESP_LOGI(TAG, "Disconnecting client..");
-                esp_ble_gatts_close(gatt_if_for_send, conn_id);
-            }
-        } else {
-            ESP_LOGW(TAG, "Silence framed message not authorized - ignored");
-        }
-    }
-}
-
-static void rx_silence_timer_cb(TimerHandle_t xTimer)
-{
-    (void)xTimer;
-    if (rx_finalize_task_handle) {
-        xTaskNotifyGive(rx_finalize_task_handle);
-    }
-}
-//////////////////////////end new////////////////////////////////
 // Start the notification task (called when BLE connects and notifications enabled)
 esp_err_t start_notification_service(void)
 {
@@ -934,13 +801,12 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
             break;
 
         case ESP_GAP_BLE_ADV_START_COMPLETE_EVT:
-            ESP_LOGI(TAG, "Advertising started.\n\r             ------------------------------------");
+            ESP_LOGI(TAG, "Advertising started.\n\r------------------------------------");
             break;
         default:
             break;
     } 
 }
-
 
 
 
@@ -1044,6 +910,21 @@ static void gatts_event_handler(esp_gatts_cb_event_t event,
             // Always refresh adv data on disconnect (covers runtime device-name changes)
             request_adv_refresh();
             
+            // Process any pending relay command AFTER disconnect and re-advertising
+            if (relay_cmd_pending) {
+                ESP_LOGI(TAG, "Processing pending relay command after disconnect");
+                
+                // Relay system already initialized at startup - just execute command
+                esp_err_t exec_result = relay_execute_command(&pending_relay_cmd);
+                if (exec_result == ESP_OK) {
+                    ESP_LOGI(TAG, "Relay command executed successfully");
+                } else {
+                    ESP_LOGE(TAG, "Failed to execute relay command: %s", esp_err_to_name(exec_result));
+                }
+                
+                relay_cmd_pending = false;  // Clear the flag
+            }
+            
             break;
 
 ////////////////////// **write event below - handle BLE messages** ////////////////////////////
@@ -1051,17 +932,11 @@ static void gatts_event_handler(esp_gatts_cb_event_t event,
 
         if (param->write.handle == char1_handle) 
         {
-//////////////////new 110326////////////////////////////
-
-            // Log safely (bounded to this fragment only)
-#if LOG_RX_FRAGMENTS
-            int len = param->write.len;
-            const uint8_t *val = param->write.value;
-            ESP_LOGI(TAG, "RX fragment: len=%d last='%c' has_hash=%d", len,
-                     (len > 0 ? (char)val[len - 1] : '?'),
-                     (memchr(val, '#', len) != NULL));
-#endif
-////////////////////end new////////////////////////
+            int len = param->write.len > MAX_DATA_LEN ? MAX_DATA_LEN : param->write.len;
+            memcpy(received_data, param->write.value, len); //copy data received to received_data buffer
+            
+            //  received_data[len] = '\0';  // Null-terminate
+            ESP_LOGI(TAG, "Received string 0: %d, %s", len, received_data);
 
             // ---------------- Eli unit -Manual UP/DOWN hold mode handling ----------------
             // Check for raw UP/DOWN keepalive messages (without # terminator) in manual mode
@@ -1171,32 +1046,14 @@ static void gatts_event_handler(esp_gatts_cb_event_t event,
         if (param->write.handle == char1_handle) {
             // Append incoming fragment
             int len = param->write.len;
-            bool rx_mutex_taken = false;
-            bool saw_hash = false;
-            if (rx_buf_mutex) {
-                xSemaphoreTake(rx_buf_mutex, portMAX_DELAY);
-                rx_mutex_taken = true;
-            }
-
-            // Append directly from the BLE stack buffer
-            int space = (MSG_BUF_LEN - 1) - message_index;
-            int frag_len = (len < space) ? len : space;
-            if (frag_len > 0) {
-                memcpy(message_buffer + message_index, param->write.value, frag_len);
-                message_index += frag_len;
-            }
+            memcpy(message_buffer + message_index, received_data, len);
+            message_index += len;
       
         // Scan for '#' terminator
-        int scan_start = message_index - frag_len;
-        if (scan_start < 0) scan_start = 0;
-        for (int i = scan_start; i < message_index; i++) 
+        for (int i = message_index - len; i < message_index; i++) 
         {
             if (message_buffer[i] == '#') 
             {
-                saw_hash = true;
-                if (rx_silence_timer && rx_silence_ms > 0) {
-                    xTimerStop(rx_silence_timer, 0);
-                }
                 message_buffer[i] = '\0'; // Replace '#' with null terminator
                 
                 // Signal that message was received (stops timeout task)
@@ -1209,8 +1066,7 @@ static void gatts_event_handler(esp_gatts_cb_event_t event,
                 // Process special commands first
                 char response[80];  // Larger buffer to prevent truncation warnings
 
-                // Optional acknowledgment (disabled for current app version)
-#if SEND_ACK_NOTIFICATIONS
+                // Simple acknowledgment for all commands
                 if (strlen(message_buffer) <= 15) {
                     // Short command - echo it back
                     snprintf(response, sizeof(response), "ACK: %s", message_buffer);
@@ -1223,7 +1079,7 @@ static void gatts_event_handler(esp_gatts_cb_event_t event,
                 if (result != ESP_OK) {
                     ESP_LOGW(TAG, "Failed to send acknowledgment: %s", esp_err_to_name(result));
                 }
-#endif
+                // No need to log successful ACK sends - reduces log noise
 
                 // ---------------- Manual UP/DOWN hold mode handling ----------------
                 bool handled_manual = false;
@@ -1382,22 +1238,18 @@ static void gatts_event_handler(esp_gatts_cb_event_t event,
                 // Valid command - proceed with execution
                 ESP_LOGI(TAG, "Authorized Message received");
                 
-                // Parse relay command and execute immediately (relays activate right away)
+                // Parse relay command and store for post-disconnect processing
                 esp_err_t parse_result = relay_parse_command_from_json(message_buffer, &pending_relay_cmd);
                 
                 if (parse_result == ESP_OK) {
-                    ESP_LOGI(TAG, "Relay command parsed successfully - activating relays now");
-                    esp_err_t exec_result = relay_execute_command(&pending_relay_cmd);
-                    if (exec_result == ESP_OK) {
-                        ESP_LOGI(TAG, "Relay command executed successfully");
-                    } else {
-                        ESP_LOGE(TAG, "Failed to execute relay command: %s", esp_err_to_name(exec_result));
-                    }
+                    ESP_LOGI(TAG, "Relay command parsed successfully - will process after disconnect");
+                    relay_cmd_pending = true;
                 } else {
                     ESP_LOGW(TAG, "Failed to parse relay command: %s", esp_err_to_name(parse_result));
+                    relay_cmd_pending = false;
                 }
                 
-                // Disconnect client after relays are active (lower priority - shortens time to activation)
+                // Disconnect current client and restart advertising immediately
                 ESP_LOGI(TAG, "Disconnecting client..");
                 esp_ble_gatts_close(gatt_if_for_send, conn_id);
                 
@@ -1411,30 +1263,8 @@ static void gatts_event_handler(esp_gatts_cb_event_t event,
                 // Reset buffer for next message
                 message_index = 0;
                 memset(message_buffer, 0, MSG_BUF_LEN);
-//////////////////new 110326////////////////////////////
-                if (rx_mutex_taken) {
-                    xSemaphoreGive(rx_buf_mutex);
-                    rx_mutex_taken = false;
-                }
-//////////////////////end new//////////////////////////
                 break;  // Exit loop after processing complete message
             }
-//////////////////new 110326////////////////////////////
-        // If we didn't see '#', optionally finalize after silence window (ATMEGA-style framing)
-        if (!saw_hash && rx_silence_timer && rx_silence_ms > 0) {
-            // Restart one-shot timer on every fragment; finalize if line goes silent.
-            BaseType_t ok1 = xTimerChangePeriod(rx_silence_timer, pdMS_TO_TICKS(rx_silence_ms), 0);
-            BaseType_t ok2 = xTimerReset(rx_silence_timer, 0);
-            if (ok1 != pdPASS || ok2 != pdPASS) {
-                ESP_LOGW(TAG, "rx_silence timer restart failed (ok1=%ld ok2=%ld)", (long)ok1, (long)ok2);
-            }
-        }
-
-        if (rx_mutex_taken) {
-            xSemaphoreGive(rx_buf_mutex);
-            rx_mutex_taken = false;
-        }
-/////////////////////////end new////////////////////////
         }
         }
 
@@ -1489,8 +1319,8 @@ void serial_command_task(void *arg) {
     ESP_LOGI(TAG, "  GET_STATUS       - Show status_reg");
     ESP_LOGI(TAG, "  SET_PROG <ver>   - Set prog_version string");
     ESP_LOGI(TAG, "  GET_PROG         - Show prog_version");
-    ESP_LOGI(TAG, "  SET <key>=<val>  - Generic set (unit_id, status_reg, prog_version, rx_silence_ms)");
-    ESP_LOGI(TAG, "  GET <key>        - Generic get (unit_id, status_reg, prog_version, rx_silence_ms)");
+    ESP_LOGI(TAG, "  SET <key>=<val>  - Generic set (unit_id, status_reg, prog_version)");
+    ESP_LOGI(TAG, "  GET <key>        - Generic get (unit_id, status_reg, prog_version)");
     ESP_LOGI(TAG, "  LIST             - List keys in NVS namespace unit_config");
     ESP_LOGI(TAG, "  HELP             - Show this help");
     
@@ -1613,20 +1443,6 @@ void serial_command_task(void *arg) {
                                 } else {
                                     printf("Error setting prog_version: %s\n", esp_err_to_name(err));
                                 }
-//////////////////new 110326////////////////////////////
-                            } else if (strcmp(key, "rx_silence_ms") == 0) {
-                                uint16_t v16 = 0;
-                                if (!parse_u16_flexible(val, &v16)) {
-                                    printf("Invalid value. Example: SET rx_silence_ms=70\n");
-                                } else {
-                                    esp_err_t err = write_rx_silence_ms_to_nvs(v16);
-                                    if (err == ESP_OK) {
-                                        printf("rx_silence_ms set to: %u\n", (unsigned)rx_silence_ms);
-                                    } else {
-                                        printf("Error setting rx_silence_ms: %s\n", esp_err_to_name(err));
-                                    }
-                                }
-///////////////////////end new///////////////////////////
                             } else {
                                 printf("Unknown key: %s\n", key);
                             }
@@ -1642,10 +1458,6 @@ void serial_command_task(void *arg) {
                             printf("unit_id: %s\n", unit_id);
                         } else if (strcmp(key, "prog_version") == 0) {
                             printf("prog_version: %s\n", prog_version);
-//////////////////new 110326////////////////////////////
-                        } else if (strcmp(key, "rx_silence_ms") == 0) {
-                            printf("rx_silence_ms: %u\n", (unsigned)rx_silence_ms);
-//////////////////////////////////////////////////////////
                         } else {
                             printf("Unknown key: %s\n", key);
                         }
@@ -1710,17 +1522,6 @@ void serial_command_task(void *arg) {
                                         } else {
                                             printf("  %s (%s) = <read error: %s>\n", info.key, type_str, esp_err_to_name(r));
                                         }
-//////////////////new 110326////////////////////////////
-
-                                    } else if (strcmp(info.key, "rx_silence_ms") == 0 && info.type == NVS_TYPE_U16) {
-                                        uint16_t v = 0;
-                                        esp_err_t r = nvs_get_u16(h, "rx_silence_ms", &v);
-                                        if (r == ESP_OK) {
-                                            printf("  %s (%s) = %u\n", info.key, type_str, (unsigned)v);
-                                        } else {
-                                            printf("  %s (%s) = <read error: %s>\n", info.key, type_str, esp_err_to_name(r));
-                                        }
-///////////////////////////end new///////////////////////////
                                     } else {
                                         printf("  %s (%s)\n", info.key, type_str);
                                     }
@@ -1779,7 +1580,7 @@ void serial_command_task(void *arg) {
 void app_main(void) 
 {
 
-   // ESP_LOGI(TAG, "=== BLE app_main STARTING ===");
+   // ESP_LOGI(TAG, "=== BLE APPLICATION STARTING ===");
 
     ESP_ERROR_CHECK(nvs_flash_init());
 
@@ -1793,20 +1594,7 @@ void app_main(void)
 
     // Load program version from NVS (always)
     load_prog_version();
-///////////////////////new 110326///////////////////////
-    // Load RX silence framing configuration (always)
-    load_rx_silence_ms();
 
-    if (rx_buf_mutex == NULL) {
-        rx_buf_mutex = xSemaphoreCreateMutex();
-    }
-    if (rx_finalize_task_handle == NULL) {
-        xTaskCreate(rx_finalize_task, "rx_finalize", 4096, NULL, 6, &rx_finalize_task_handle);
-    }
-    if (rx_silence_timer == NULL) {
-        rx_silence_timer = xTimerCreate("rx_silence", pdMS_TO_TICKS(1000), pdFALSE, NULL, rx_silence_timer_cb);
-    }
-////////////////////////////end new////////////////////////////////
     ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT));
     esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_bt_controller_init(&bt_cfg));

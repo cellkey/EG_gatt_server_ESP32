@@ -6,13 +6,11 @@ Eli - Continuas relay activation. Led blinks while relay is active.
 #include <stdio.h>
 #include <stdint.h>
 #include <inttypes.h>
-#include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
-#include "freertos/semphr.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "esp_log.h"
@@ -27,32 +25,29 @@ Eli - Continuas relay activation. Led blinks while relay is active.
 #include "driver/gpio.h"
 #include "encryption.h"
 #include "relay_control.h"
+#include "esp_task_wdt.h"
 
 #define TAG "EG_BLE"
 
-// On-board LED: status indicator — blink when advertising, steady on when connected
+// Watchdog Timer Configuration
+  // Set watchdog timeout to 8 seconds (default: 5, can be changed to any value)
+#define WATCHDOG_TIMEOUT_SECONDS 8
+// On-board LED: blink when manual-hold relay is active (keepalives received)
 
 #define LED_GPIO         23  //little board configuration
 /* #efine LED_GPIO       21 //  //Eli board configuration */
 
-#define LED_BLINK_MS     500
-
-// App does not require per-command ACK notifications
-#define SEND_ACK_NOTIFICATIONS 0
-
-// Disable per-fragment RX logging (too noisy)
-#define LOG_RX_FRAGMENTS 0
+#define LED_BLINK_MS     300
 
 // Relay system initialization flag
 static bool relay_system_initialized = false;
 
-// Configuration: Set to 1 for dynamic unit ID (read from NVS), 0 for hardcoded name
-#define USE_DYNAMIC_UNIT_ID 1
+// Configuration: Set to 1 for NVS-based unit ID, 0 for hardcoded name
+#define USE_DYNAMIC_UNIT_ID 1  // Use unit_id from NVS with DEFAULT_UNIT_ID as fallback
 
-// Default unit ID for hardcoded mode
-//#define DEFAULT_UNIT_ID "cr16061952"
-#define DEFAULT_UNIT_ID "cr16061992"  //sport Alonim
-//#define DEFAULT_UNIT_ID "cr17061949"  //Eli's unit ID
+// Default unit ID for first-boot / when NVS key does not exist yet
+#define DEFAULT_UNIT_ID "cr16061947"  //Eli unit ID
+//#define DEFAULT_UNIT_ID "cr16061992"  //original unit ID
 
 // Function declarations
 esp_err_t read_unit_id_from_nvs(char* buffer, size_t buffer_size);
@@ -75,6 +70,7 @@ static uint16_t char2_handle;  // FFE2
  unsigned long rnd, *rnd_ptr;
  char encrypted[16]; 
 
+#define MAX_DATA_LEN  50
 #define MSG_BUF_LEN 64
 
 #define NOTIFICATION_QUEUE_SIZE 10
@@ -95,35 +91,25 @@ static QueueHandle_t notification_queue = NULL;
 static TaskHandle_t notification_task_handle = NULL;
 static bool notification_task_running = false;
 
-// RX framing: if no '#' terminator arrives, finalize message after this silence window (ms).
-// Stored in NVS (unit_config/rx_silence_ms). Set to 0 to disable and use only '#'.
-static uint16_t rx_silence_ms = 70;
-static SemaphoreHandle_t rx_buf_mutex = NULL;
-static TaskHandle_t rx_finalize_task_handle = NULL;
-static TimerHandle_t rx_silence_timer = NULL;
-
 // Connection timeout management
 static TaskHandle_t connection_timeout_task_handle = NULL;
 static bool connection_timeout_running = false;
 static bool message_received_flag = false;
 
 
-// Relay command storage for parsing/execution
+// Relay command storage for post-disconnect processing
 static relay_command_t pending_relay_cmd = {0};
+static bool relay_cmd_pending = false;
 
 // Unit ID management (NVS-based configuration)
 #define UNIT_ID_MAX_LEN 16
 static char unit_id[UNIT_ID_MAX_LEN] = DEFAULT_UNIT_ID;  // Default fallback
 
-// Status register stored in NVS (namespace: unit_config, key: status_reg)
-static uint16_t status_reg = 0x0000;
+#define MANUAL_MODE_TIMEOUT_MS 300   //400 Timeout after first keepalive (gap between keepalives)
+#define MANUAL_MODE_NO_KEEPALIVE_MS 700  // 700Timeout when NO keepalive ever (button released immediately) - SAFETY
 
-// Program version stored in NVS (namespace: unit_config, key: prog_version)
-#define PROG_VERSION_MAX_LEN 16
-static char prog_version[PROG_VERSION_MAX_LEN] = "0.0.0";
-
-#define MANUAL_MODE_TIMEOUT_MS 350   // Timeout after first keepalive (gap between keepalives)
-#define MANUAL_MODE_NO_KEEPALIVE_MS 700  // Timeout when NO keepalive ever (button released immediately) - SAFETY
+#define AUTO_DISCONNECT_AFTER_COMMAND 1      // 0 = stay connected (app disconnects), 1 = auto-disconnect after relay command
+#define AUTO_DISCONNECT_DELAY_MS      5000   // Delay (ms) before auto-disconnect when enabled
 
 // Special "hold while pressed" mode for unit IDs starting with "cr17"
 static bool manual_mode_unit = false;        // This firmware build is for a manual-hold unit
@@ -133,10 +119,10 @@ static bool manual_relay2_on = false;
 static TickType_t last_manual_msg_tick = 0;  // Last time we saw UP/DOWN traffic
 static bool manual_keepalive_received = false;  // True after first raw UP/DOWN keepalive
 static TaskHandle_t manual_monitor_task_handle = NULL;
-static TaskHandle_t status_led_task_handle = NULL;
-static TickType_t last_led_toggle_tick = 0;    // For status LED blink when advertising
+static TickType_t last_led_toggle_tick = 0;    // For 500ms blink when relay active
 static bool led_state = false;                 // Current LED on/off state
 
+static uint8_t received_data[MAX_DATA_LEN + 1];  // +1 for null-terminator
 static uint16_t conn_id = 0;
 static bool is_connected = false;
 static esp_gatt_if_t gatt_if_for_send = 0;
@@ -165,17 +151,6 @@ static esp_ble_adv_params_t adv_params = {
     .channel_map = ADV_CHNL_ALL,
     .adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
 };
-
-static void request_adv_refresh(void)
-{
-    // Rebuild advertising data (includes device name when adv_data.include_name = true).
-    // The GAP handler starts advertising when ADV_DATA_SET_COMPLETE arrives.
-    (void)esp_ble_gap_stop_advertising();
-    esp_err_t err = esp_ble_gap_config_adv_data(&adv_data);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to config adv data: %s", esp_err_to_name(err));
-    }
-}
 //----------------unit ID management new below -----------------------
 // Unit ID Management Functions (ESP32 equivalent of AVR EEPROM)
 
@@ -231,259 +206,26 @@ esp_err_t write_unit_id_to_nvs(const char* new_unit_id) {
     return err;
 }
 
-static esp_err_t read_prog_version_from_nvs(char *buffer, size_t max_len)
-{
-    if (!buffer || max_len == 0) return ESP_ERR_INVALID_ARG;
-
-    nvs_handle_t nvs_handle;
-    esp_err_t err = nvs_open("unit_config", NVS_READONLY, &nvs_handle);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to open NVS for reading prog_version: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    size_t required_size = max_len;
-    err = nvs_get_str(nvs_handle, "prog_version", buffer, &required_size);
-    nvs_close(nvs_handle);
-
-    if (err == ESP_OK) {
-        ESP_LOGI(TAG, "prog_version loaded from NVS: %s", buffer);
-    } else if (err == ESP_ERR_NVS_NOT_FOUND) {
-        ESP_LOGW(TAG, "prog_version not found in NVS, using default %s", prog_version);
-    } else {
-        ESP_LOGE(TAG, "Error reading prog_version: %s", esp_err_to_name(err));
-    }
-
-    return err;
-}
-
-static esp_err_t write_prog_version_to_nvs(const char *new_ver)
-{
-    if (!new_ver || strlen(new_ver) == 0 || strlen(new_ver) >= PROG_VERSION_MAX_LEN) {
-        ESP_LOGE(TAG, "Invalid prog_version for writing");
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    nvs_handle_t nvs_handle;
-    esp_err_t err = nvs_open("unit_config", NVS_READWRITE, &nvs_handle);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to open NVS for writing prog_version: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    err = nvs_set_str(nvs_handle, "prog_version", new_ver);
-    if (err == ESP_OK) {
-        err = nvs_commit(nvs_handle);
-        if (err == ESP_OK) {
-            strncpy(prog_version, new_ver, PROG_VERSION_MAX_LEN - 1);
-            prog_version[PROG_VERSION_MAX_LEN - 1] = '\0';
-            ESP_LOGI(TAG, "prog_version saved to NVS: %s", prog_version);
-        }
-    }
-
-    nvs_close(nvs_handle);
-    return err;
-}
-
-static esp_err_t read_status_reg_from_nvs(uint16_t *out_value)
-{
-    if (!out_value) return ESP_ERR_INVALID_ARG;
-
-    nvs_handle_t nvs_handle;
-    esp_err_t err = nvs_open("unit_config", NVS_READONLY, &nvs_handle);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to open NVS for reading: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    err = nvs_get_u16(nvs_handle, "status_reg", out_value);
-    nvs_close(nvs_handle);
-
-    if (err == ESP_OK) {
-        ESP_LOGI(TAG, "status_reg loaded from NVS: 0x%04X", (unsigned)*out_value);
-    } else if (err == ESP_ERR_NVS_NOT_FOUND) {
-        ESP_LOGW(TAG, "status_reg not found in NVS, using default 0x0000");
-    } else {
-        ESP_LOGE(TAG, "Error reading status_reg: %s", esp_err_to_name(err));
-    }
-
-    return err;
-}
-
-static esp_err_t write_status_reg_to_nvs(uint16_t value)
-{
-    nvs_handle_t nvs_handle;
-    esp_err_t err = nvs_open("unit_config", NVS_READWRITE, &nvs_handle);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to open NVS for writing: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    err = nvs_set_u16(nvs_handle, "status_reg", value);
-    if (err == ESP_OK) {
-        err = nvs_commit(nvs_handle);
-        if (err == ESP_OK) {
-            status_reg = value;
-            ESP_LOGI(TAG, "status_reg saved to NVS: 0x%04X", (unsigned)status_reg);
-        }
-    }
-
-    nvs_close(nvs_handle);
-    return err;
-}
-
-static void load_status_reg(void)
-{
-    uint16_t val = 0x0000;
-    esp_err_t err = read_status_reg_from_nvs(&val);
-    if (err == ESP_OK) {
-        status_reg = val;
-        return;
-    }
-
-    // If not present (or read failed), ensure we have a defined default in NVS too.
-    status_reg = 0x0000;
-    write_status_reg_to_nvs(status_reg);
-}
-
-static void load_prog_version(void)
-{
-    char buf[PROG_VERSION_MAX_LEN] = {0};
-    if (read_prog_version_from_nvs(buf, sizeof(buf)) == ESP_OK) {
-        strncpy(prog_version, buf, PROG_VERSION_MAX_LEN - 1);
-        prog_version[PROG_VERSION_MAX_LEN - 1] = '\0';
-        return;
-    }
-
-    // If not present (or read failed), ensure we have a defined default in NVS too.
-    write_prog_version_to_nvs(prog_version);
-}
-//////////////////////new 110326//////////////////
-static esp_err_t read_rx_silence_ms_from_nvs(uint16_t *out_value)
-{
-    if (!out_value) return ESP_ERR_INVALID_ARG;
-
-    nvs_handle_t nvs_handle;
-    esp_err_t err = nvs_open("unit_config", NVS_READONLY, &nvs_handle);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to open NVS for reading rx_silence_ms: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    err = nvs_get_u16(nvs_handle, "rx_silence_ms", out_value);
-    nvs_close(nvs_handle);
-
-    if (err == ESP_OK) {
-        ESP_LOGI(TAG, "rx_silence_ms loaded from NVS: %u", (unsigned)*out_value);
-    } else if (err == ESP_ERR_NVS_NOT_FOUND) {
-        ESP_LOGW(TAG, "rx_silence_ms not found in NVS, using default %u", (unsigned)rx_silence_ms);
-    } else {
-        ESP_LOGE(TAG, "Error reading rx_silence_ms: %s", esp_err_to_name(err));
-    }
-
-    return err;
-}
-
-static esp_err_t write_rx_silence_ms_to_nvs(uint16_t value)
-{
-    nvs_handle_t nvs_handle;
-    esp_err_t err = nvs_open("unit_config", NVS_READWRITE, &nvs_handle);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to open NVS for writing rx_silence_ms: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    err = nvs_set_u16(nvs_handle, "rx_silence_ms", value);
-    if (err == ESP_OK) {
-        err = nvs_commit(nvs_handle);
-        if (err == ESP_OK) {
-            rx_silence_ms = value;
-            ESP_LOGI(TAG, "rx_silence_ms saved to NVS: %u", (unsigned)rx_silence_ms);
-        }
-    }
-
-    nvs_close(nvs_handle);
-    return err;
-}
-
-static void load_rx_silence_ms(void)
-{
-    uint16_t v = 0;
-    if (read_rx_silence_ms_from_nvs(&v) == ESP_OK) {
-        rx_silence_ms = v;
-        return;
-    }
-
-    // If not present (or read failed), ensure we have a defined default in NVS too.
-    write_rx_silence_ms_to_nvs(rx_silence_ms);
-}
-/////////////////end of new/////////////////////////////////////
-static char *skip_spaces(char *s)
-{
-    while (s && *s && isspace((unsigned char)*s)) s++;
-    return s;
-}
-
-static void rstrip_spaces(char *s)
-{
-    if (!s) return;
-    size_t n = strlen(s);
-    while (n > 0 && isspace((unsigned char)s[n - 1])) {
-        s[n - 1] = '\0';
-        n--;
-    }
-}
-
-static bool parse_u16_flexible(const char *s, uint16_t *out)
-{
-    if (!s || !out) return false;
-
-    s = skip_spaces((char *)s);
-    if (*s == '\0') return false;
-
-    // If value is 1-4 hex digits (e.g. "0001", "1A2B"), treat as hex.
-    // If it starts with 0x/0X, also treat as hex.
-    int base = 10;
-    const char *p = s;
-    if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
-        base = 16;
-        p += 2;
-        if (*p == '\0') return false;
-    } else {
-        size_t len = strlen(p);
-        if (len >= 1 && len <= 4) {
-            bool all_hex = true;
-            for (size_t i = 0; i < len; i++) {
-                if (!isxdigit((unsigned char)p[i])) { all_hex = false; break; }
-            }
-            if (all_hex) base = 16;
-        }
-    }
-
-    char *endp = NULL;
-    unsigned long v = strtoul(s, &endp, base);
-    if (s[0] == '\0' || (endp && *skip_spaces(endp) != '\0') || v > 0xFFFFUL) return false;
-    *out = (uint16_t)v;
-    return true;
-}
-
 void load_unit_configuration(void) {
     // Try to load unit ID from NVS
-    if (read_unit_id_from_nvs(unit_id, UNIT_ID_MAX_LEN) != ESP_OK) {
-        // Fallback: Generate MAC-based ID
-        uint8_t mac[6];
-        esp_err_t ret = esp_read_mac(mac, ESP_MAC_WIFI_STA);
-        if (ret == ESP_OK) {
-            snprintf(unit_id, UNIT_ID_MAX_LEN, "EG%02X%02X%02X", mac[3], mac[4], mac[5]);
-            ESP_LOGI(TAG, "Generated MAC-based unit ID: %s", unit_id);
-            // Save the generated ID for next boot
-            write_unit_id_to_nvs(unit_id);
-        } else {
-            // Keep default DEFAULT_UNIT_ID if everything fails
-            ESP_LOGW(TAG, "Using hardcoded default unit ID: %s", unit_id);
-        }
+    esp_err_t err = read_unit_id_from_nvs(unit_id, UNIT_ID_MAX_LEN);
+    if (err == ESP_OK) {
+        // unit_id already filled by read_unit_id_from_nvs
+        ESP_LOGI(TAG, "Using unit ID from NVS: %s", unit_id);
+    } else if (err == ESP_ERR_NVS_NOT_FOUND) {
+        // NVS key missing: use DEFAULT_UNIT_ID and store it once
+        strncpy(unit_id, DEFAULT_UNIT_ID, UNIT_ID_MAX_LEN - 1);
+        unit_id[UNIT_ID_MAX_LEN - 1] = '\0';
+        ESP_LOGI(TAG, "NVS unit_id not found. Using default and saving: %s", unit_id);
+        write_unit_id_to_nvs(unit_id);
+    } else {
+        // Any other error: fall back to DEFAULT_UNIT_ID but don't overwrite NVS
+        strncpy(unit_id, DEFAULT_UNIT_ID, UNIT_ID_MAX_LEN - 1);
+        unit_id[UNIT_ID_MAX_LEN - 1] = '\0';
+        ESP_LOGW(TAG, "Error reading unit_id from NVS (%s). Using default: %s",
+                 esp_err_to_name(err), unit_id);
     }
-    
+
     ESP_LOGI(TAG, "Active unit ID: %s", unit_id);
 }
 
@@ -494,8 +236,27 @@ static void manual_monitor_task(void *arg)
     const TickType_t timeout_ticks = pdMS_TO_TICKS(MANUAL_MODE_TIMEOUT_MS);
     const TickType_t no_keepalive_ticks = pdMS_TO_TICKS(MANUAL_MODE_NO_KEEPALIVE_MS);
 
+    // Add this task to watchdog
+    esp_task_wdt_add(NULL);
+
     while (1) {
+        // Feed watchdog periodically
+        esp_task_wdt_reset();
+        
         TickType_t now = xTaskGetTickCount();
+
+        // LED: blink when relay active (keepalives received), off when relay deactivated
+        if (manual_mode_unit && manual_session_active && (manual_relay1_on || manual_relay2_on)) {
+            TickType_t elapsed_led = now - last_led_toggle_tick;
+            if (elapsed_led >= pdMS_TO_TICKS(LED_BLINK_MS)) {
+                led_state = !led_state;
+                gpio_set_level(LED_GPIO, led_state ? 1 : 0);
+                last_led_toggle_tick = now;
+            }
+        } else {
+            gpio_set_level(LED_GPIO, 0);  // LED off when relay inactive
+            led_state = false;
+        }
 
         // SAFETY: Always enforce timeout when relay is active - two cases:
         // 1) Keepalives received then stopped (500ms gap) - user released
@@ -531,30 +292,28 @@ static void manual_monitor_task(void *arg)
     }
 }
 
-// Status LED task: blink when advertising (!is_connected), steady on when connected
-static void status_led_task(void *arg)
+#if AUTO_DISCONNECT_AFTER_COMMAND
+// Delayed disconnect task so we don't block the GATTS callback
+static void delayed_disconnect_task(void *arg)
 {
-    const TickType_t check_interval = pdMS_TO_TICKS(50);
-
-    while (1) {
-        TickType_t now = xTaskGetTickCount();
-
-        if (is_connected) {
-            gpio_set_level(LED_GPIO, 1);   // Steady on when connected
-            led_state = true;
-        } else {
-            // Advertising: blink every LED_BLINK_MS
-            TickType_t elapsed_led = now - last_led_toggle_tick;
-            if (elapsed_led >= pdMS_TO_TICKS(LED_BLINK_MS)) {
-                led_state = !led_state;
-                gpio_set_level(LED_GPIO, led_state ? 1 : 0);
-                last_led_toggle_tick = now;
-            }
-        }
-
-        vTaskDelay(check_interval);
+    // Add this task to watchdog
+    esp_task_wdt_add(NULL);
+    
+    // Simple delay, then close connection if still active (feed watchdog during delay)
+    int delay_steps = AUTO_DISCONNECT_DELAY_MS / 100;
+    for (int i = 0; i < delay_steps; i++) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        esp_task_wdt_reset();
     }
+
+    if (is_connected) {
+        ESP_LOGI(TAG, "Auto-disconnect after %d ms", AUTO_DISCONNECT_DELAY_MS);
+        esp_ble_gatts_close(gatt_if_for_send, conn_id);
+    }
+
+    vTaskDelete(NULL);
 }
+#endif
 
 // Event-driven notification task - only sends when there's data to send
 void notification_task(void *arg)
@@ -563,6 +322,9 @@ void notification_task(void *arg)
     
    // ESP_LOGI(TAG, "Notification task started - waiting for messages");
 
+    // Add this task to watchdog
+    esp_task_wdt_add(NULL);
+
     notification_task_running = true;
 
     while (notification_task_running) 
@@ -570,6 +332,9 @@ void notification_task(void *arg)
         // Wait for a message to send (blocking wait)
         if (xQueueReceive(notification_queue, &msg, pdMS_TO_TICKS(1000)) == pdTRUE) 
         {
+            // Feed watchdog before processing
+            esp_task_wdt_reset();
+            
             // Only send if client is connected and notifications are enabled
             if (is_connected && notify_enabled) 
             {
@@ -592,8 +357,11 @@ void notification_task(void *arg)
             // {
             //     ESP_LOGW(TAG, "Cannot send notification - not connected or notifications disabled");
             // }
+        } else {
+            // Timeout occurred - feed watchdog to prevent timeout during idle wait
+            esp_task_wdt_reset();
         }
-        // If no message received within timeout, just continue loop to check running flag
+        // Continue loop to check running flag
     }
 
   //  ESP_LOGI(TAG, "Notification task stopped");
@@ -605,11 +373,17 @@ void notification_task(void *arg)
 void connection_timeout_task(void *arg)
 {
    // ESP_LOGI(TAG, "Connection timeout task started - waiting for message");
+    // Add this task to watchdog
+    esp_task_wdt_add(NULL);
+    
     connection_timeout_running = true;
     message_received_flag = false;  // Reset flag for this connection
 
-    // Wait 3 seconds
-    vTaskDelay(pdMS_TO_TICKS(3000));
+    // Wait 3 seconds (feed watchdog during wait)
+    for (int i = 0; i < 30; i++) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        esp_task_wdt_reset();
+    }
 
     if (connection_timeout_running) {
         if (!message_received_flag) {
@@ -665,10 +439,20 @@ esp_err_t stop_connection_timeout(void)
     }
 
     connection_timeout_running = false;
+    
+    // Wait for task to finish
+    uint32_t timeout_ms = 500;
+    uint32_t elapsed = 0;
+    while (connection_timeout_task_handle != NULL && elapsed < timeout_ms) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+        elapsed += 10;
+    }
 
-    // Do not block here (this is called from BLE callback paths). Just stop promptly.
-    vTaskDelete(connection_timeout_task_handle);
-    connection_timeout_task_handle = NULL;
+    if (connection_timeout_task_handle != NULL) {
+      //  ESP_LOGW(TAG, "Force deleting connection timeout task");
+        vTaskDelete(connection_timeout_task_handle);
+        connection_timeout_task_handle = NULL;
+    }
 
     connection_timeout_running = false;
   //  ESP_LOGI(TAG, "Connection timeout monitoring stopped");
@@ -709,80 +493,7 @@ esp_err_t ble_send_notification(const char* message, bool is_response)
    // ESP_LOGI(TAG, "Queued notification: %s", message);
     return ESP_OK;
 }
-//////////////new 110326//////////////////////////////////////
-static void rx_finalize_task(void *arg)
-{
-    (void)arg;
-    char local[MSG_BUF_LEN] = {0};
 
-    while (1) {
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-
-        if (rx_buf_mutex) {
-            xSemaphoreTake(rx_buf_mutex, portMAX_DELAY);
-        }
-
-        int len = message_index;
-        if (len > 0) {
-            if (len >= (int)sizeof(local)) len = (int)sizeof(local) - 1;
-            memcpy(local, message_buffer, len);
-            local[len] = '\0';
-
-            // Clear shared buffer so new fragments can accumulate
-            message_index = 0;
-            memset(message_buffer, 0, MSG_BUF_LEN);
-        } else {
-            local[0] = '\0';
-        }
-
-        if (rx_buf_mutex) {
-            xSemaphoreGive(rx_buf_mutex);
-        }
-
-        if (local[0] == '\0') {
-            continue;
-        }
-
-        // Treat as complete message due to silence (ATMEGA-style framing)
-        message_received_flag = true;
-        stop_connection_timeout();
-
-        ESP_LOGI(TAG, "RX silence finalize (%u ms): %s", (unsigned)rx_silence_ms, local);
-
-        if (strstr(local, encrypted_data) != NULL) {
-            ESP_LOGI(TAG, "Authorized Message received (silence framed)");
-
-            esp_err_t parse_result = relay_parse_command_from_json(local, &pending_relay_cmd);
-            if (parse_result == ESP_OK) {
-                ESP_LOGI(TAG, "Relay command parsed successfully - activating relays now");
-                esp_err_t exec_result = relay_execute_command(&pending_relay_cmd);
-                if (exec_result == ESP_OK) {
-                    ESP_LOGI(TAG, "Relay command executed successfully");
-                } else {
-                    ESP_LOGE(TAG, "Failed to execute relay command: %s", esp_err_to_name(exec_result));
-                }
-            } else {
-                ESP_LOGW(TAG, "Failed to parse relay command: %s", esp_err_to_name(parse_result));
-            }
-
-            if (is_connected) {
-                ESP_LOGI(TAG, "Disconnecting client..");
-                esp_ble_gatts_close(gatt_if_for_send, conn_id);
-            }
-        } else {
-            ESP_LOGW(TAG, "Silence framed message not authorized - ignored");
-        }
-    }
-}
-
-static void rx_silence_timer_cb(TimerHandle_t xTimer)
-{
-    (void)xTimer;
-    if (rx_finalize_task_handle) {
-        xTaskNotifyGive(rx_finalize_task_handle);
-    }
-}
-//////////////////////////end new////////////////////////////////
 // Start the notification task (called when BLE connects and notifications enabled)
 esp_err_t start_notification_service(void)
 {
@@ -872,8 +583,7 @@ static esp_gatts_attr_db_t gatt_db[GATTS_NUM_HANDLE] =
             ESP_UUID_LEN_16, (uint8_t*)&(uint16_t){ESP_GATT_UUID_CHAR_DECLARE},
             ESP_GATT_PERM_READ,
             sizeof(uint8_t), sizeof(uint8_t),
-            // Allow both write (with response) and write without response for tighter keepalive timing
-            (uint8_t*)&(uint8_t){ESP_GATT_CHAR_PROP_BIT_WRITE | ESP_GATT_CHAR_PROP_BIT_WRITE_NR}
+            (uint8_t*)&(uint8_t){ESP_GATT_CHAR_PROP_BIT_WRITE}
         }
     },
 
@@ -934,13 +644,12 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
             break;
 
         case ESP_GAP_BLE_ADV_START_COMPLETE_EVT:
-            ESP_LOGI(TAG, "Advertising started.\n\r             ------------------------------------");
+            ESP_LOGI(TAG, "Advertising started.\n\r------------------------------------");
             break;
         default:
             break;
     } 
 }
-
 
 
 
@@ -998,22 +707,11 @@ static void gatts_event_handler(esp_gatts_cb_event_t event,
             conn_id = param->connect.conn_id;
             gatt_if_for_send = gatts_if;
 
-            // Request a shorter connection interval so the central can deliver keepalives more frequently.
-            // Units: interval in 1.25ms steps; timeout in 10ms steps.
-            // Target ~30-50ms interval (matches app's ~50ms keepalive cadence).
-            esp_ble_conn_update_params_t conn_params = {0};
-            memcpy(conn_params.bda, param->connect.remote_bda, sizeof(conn_params.bda));
-            conn_params.min_int = 24;   // 30ms
-            conn_params.max_int = 40;   // 50ms
-            conn_params.latency = 0;
-            conn_params.timeout = 400;  // 4s
-            esp_ble_gap_update_conn_params(&conn_params);
-
             // Initialize relay system on first connection (avoids boot conflicts)
             // MOVED: Relay initialization now happens after disconnect for better performance
             
             // Connection established - start notification service
-            start_notification_service();
+            start_notification_service();// marked for IPhone application test 28022026
            // ESP_LOGI(TAG, "Client connected, notifications auto-enabled");
 
             // Start connection timeout monitoring (2-3 seconds to receive a message)
@@ -1041,9 +739,12 @@ static void gatts_event_handler(esp_gatts_cb_event_t event,
             stop_connection_timeout();
             stop_notification_service();
 //----------------new above -----------------------            
-            // Always refresh adv data on disconnect (covers runtime device-name changes)
-            request_adv_refresh();
+            esp_ble_gap_start_advertising(&adv_params);
             
+            // Relay commands are now executed immediately when parsed in WRITE_EVT,
+            // so we no longer process relay_cmd_pending here.
+            relay_cmd_pending = false;
+
             break;
 
 ////////////////////// **write event below - handle BLE messages** ////////////////////////////
@@ -1051,17 +752,11 @@ static void gatts_event_handler(esp_gatts_cb_event_t event,
 
         if (param->write.handle == char1_handle) 
         {
-//////////////////new 110326////////////////////////////
-
-            // Log safely (bounded to this fragment only)
-#if LOG_RX_FRAGMENTS
-            int len = param->write.len;
-            const uint8_t *val = param->write.value;
-            ESP_LOGI(TAG, "RX fragment: len=%d last='%c' has_hash=%d", len,
-                     (len > 0 ? (char)val[len - 1] : '?'),
-                     (memchr(val, '#', len) != NULL));
-#endif
-////////////////////end new////////////////////////
+            int len = param->write.len > MAX_DATA_LEN ? MAX_DATA_LEN : param->write.len;
+            memcpy(received_data, param->write.value, len); //copy data received to received_data buffer
+            
+            //  received_data[len] = '\0';  // Null-terminate
+            ESP_LOGI(TAG, "Received string 0: %d, %s", len, received_data);
 
             // ---------------- Eli unit -Manual UP/DOWN hold mode handling ----------------
             // Check for raw UP/DOWN keepalive messages (without # terminator) in manual mode
@@ -1171,32 +866,14 @@ static void gatts_event_handler(esp_gatts_cb_event_t event,
         if (param->write.handle == char1_handle) {
             // Append incoming fragment
             int len = param->write.len;
-            bool rx_mutex_taken = false;
-            bool saw_hash = false;
-            if (rx_buf_mutex) {
-                xSemaphoreTake(rx_buf_mutex, portMAX_DELAY);
-                rx_mutex_taken = true;
-            }
-
-            // Append directly from the BLE stack buffer
-            int space = (MSG_BUF_LEN - 1) - message_index;
-            int frag_len = (len < space) ? len : space;
-            if (frag_len > 0) {
-                memcpy(message_buffer + message_index, param->write.value, frag_len);
-                message_index += frag_len;
-            }
+            memcpy(message_buffer + message_index, received_data, len);
+            message_index += len;
       
         // Scan for '#' terminator
-        int scan_start = message_index - frag_len;
-        if (scan_start < 0) scan_start = 0;
-        for (int i = scan_start; i < message_index; i++) 
+        for (int i = message_index - len; i < message_index; i++) 
         {
             if (message_buffer[i] == '#') 
             {
-                saw_hash = true;
-                if (rx_silence_timer && rx_silence_ms > 0) {
-                    xTimerStop(rx_silence_timer, 0);
-                }
                 message_buffer[i] = '\0'; // Replace '#' with null terminator
                 
                 // Signal that message was received (stops timeout task)
@@ -1209,8 +886,7 @@ static void gatts_event_handler(esp_gatts_cb_event_t event,
                 // Process special commands first
                 char response[80];  // Larger buffer to prevent truncation warnings
 
-                // Optional acknowledgment (disabled for current app version)
-#if SEND_ACK_NOTIFICATIONS
+                // Simple acknowledgment for all commands
                 if (strlen(message_buffer) <= 15) {
                     // Short command - echo it back
                     snprintf(response, sizeof(response), "ACK: %s", message_buffer);
@@ -1223,7 +899,7 @@ static void gatts_event_handler(esp_gatts_cb_event_t event,
                 if (result != ESP_OK) {
                     ESP_LOGW(TAG, "Failed to send acknowledgment: %s", esp_err_to_name(result));
                 }
-#endif
+                // No need to log successful ACK sends - reduces log noise
 
                 // ---------------- Manual UP/DOWN hold mode handling ----------------
                 bool handled_manual = false;
@@ -1382,11 +1058,12 @@ static void gatts_event_handler(esp_gatts_cb_event_t event,
                 // Valid command - proceed with execution
                 ESP_LOGI(TAG, "Authorized Message received");
                 
-                // Parse relay command and execute immediately (relays activate right away)
+                // Parse relay command and execute immediately
                 esp_err_t parse_result = relay_parse_command_from_json(message_buffer, &pending_relay_cmd);
                 
                 if (parse_result == ESP_OK) {
-                    ESP_LOGI(TAG, "Relay command parsed successfully - activating relays now");
+                    ESP_LOGI(TAG, "Relay command parsed successfully - executing now");
+                    relay_cmd_pending = true;
                     esp_err_t exec_result = relay_execute_command(&pending_relay_cmd);
                     if (exec_result == ESP_OK) {
                         ESP_LOGI(TAG, "Relay command executed successfully");
@@ -1395,11 +1072,21 @@ static void gatts_event_handler(esp_gatts_cb_event_t event,
                     }
                 } else {
                     ESP_LOGW(TAG, "Failed to parse relay command: %s", esp_err_to_name(parse_result));
+                    relay_cmd_pending = false;
                 }
-                
-                // Disconnect client after relays are active (lower priority - shortens time to activation)
-                ESP_LOGI(TAG, "Disconnecting client..");
-                esp_ble_gatts_close(gatt_if_for_send, conn_id);
+
+#if AUTO_DISCONNECT_AFTER_COMMAND
+                // Schedule delayed disconnect so app has time to process response
+                ESP_LOGI(TAG, "Scheduling disconnect in %d ms", AUTO_DISCONNECT_DELAY_MS);
+                xTaskCreate(
+                    delayed_disconnect_task,
+                    "delayed_disc",
+                    2048,
+                    NULL,
+                    5,
+                    NULL
+                );
+#endif
                 
             } else {
                 // Invalid command - reject
@@ -1411,30 +1098,8 @@ static void gatts_event_handler(esp_gatts_cb_event_t event,
                 // Reset buffer for next message
                 message_index = 0;
                 memset(message_buffer, 0, MSG_BUF_LEN);
-//////////////////new 110326////////////////////////////
-                if (rx_mutex_taken) {
-                    xSemaphoreGive(rx_buf_mutex);
-                    rx_mutex_taken = false;
-                }
-//////////////////////end new//////////////////////////
                 break;  // Exit loop after processing complete message
             }
-//////////////////new 110326////////////////////////////
-        // If we didn't see '#', optionally finalize after silence window (ATMEGA-style framing)
-        if (!saw_hash && rx_silence_timer && rx_silence_ms > 0) {
-            // Restart one-shot timer on every fragment; finalize if line goes silent.
-            BaseType_t ok1 = xTimerChangePeriod(rx_silence_timer, pdMS_TO_TICKS(rx_silence_ms), 0);
-            BaseType_t ok2 = xTimerReset(rx_silence_timer, 0);
-            if (ok1 != pdPASS || ok2 != pdPASS) {
-                ESP_LOGW(TAG, "rx_silence timer restart failed (ok1=%ld ok2=%ld)", (long)ok1, (long)ok2);
-            }
-        }
-
-        if (rx_mutex_taken) {
-            xSemaphoreGive(rx_buf_mutex);
-            rx_mutex_taken = false;
-        }
-/////////////////////////end new////////////////////////
         }
         }
 
@@ -1450,7 +1115,7 @@ static void gatts_event_handler(esp_gatts_cb_event_t event,
                 ESP_LOGI(TAG, "Notifications ENABLED by client");
                 
                 // Start notification service when client enables notifications
-                start_notification_service();
+                start_notification_service(); //marked for IPhone application test 28022026
                 
                 // Welcome message removed - client will get "Message OK" response instead
             }
@@ -1481,279 +1146,88 @@ void serial_command_task(void *arg) {
     char line[28];
     int pos = 0;
     
+    // Add this task to watchdog
+    esp_task_wdt_add(NULL);
+    
     ESP_LOGI(TAG, "Serial command processor started");
     ESP_LOGI(TAG, "Available commands:");
     ESP_LOGI(TAG, "  SET_ID <unit_id>  - Program unit ID");
     ESP_LOGI(TAG, "  GET_ID           - Show current unit ID");
-    ESP_LOGI(TAG, "  SET_STATUS <val> - Set status_reg (e.g. 0x1234 or 4660)");
-    ESP_LOGI(TAG, "  GET_STATUS       - Show status_reg");
-    ESP_LOGI(TAG, "  SET_PROG <ver>   - Set prog_version string");
-    ESP_LOGI(TAG, "  GET_PROG         - Show prog_version");
-    ESP_LOGI(TAG, "  SET <key>=<val>  - Generic set (unit_id, status_reg, prog_version, rx_silence_ms)");
-    ESP_LOGI(TAG, "  GET <key>        - Generic get (unit_id, status_reg, prog_version, rx_silence_ms)");
-    ESP_LOGI(TAG, "  LIST             - List keys in NVS namespace unit_config");
     ESP_LOGI(TAG, "  HELP             - Show this help");
     
     while (1) {
+        // Feed watchdog periodically
+        esp_task_wdt_reset();
+        
         int c = getchar();
         if (c != EOF) {
             if (c == '\r' || c == '\n') {
-                // Make console output user-friendly: ensure command output starts on a fresh line.
-                // Also handle empty lines by just re-printing the prompt cleanly.
-                if (pos == 0) {
-                    printf("\r\nnvs> ");
-                    fflush(stdout);
-                    vTaskDelay(pdMS_TO_TICKS(10));
-                    continue;
-                }
-
-                printf("\r\n");
-                fflush(stdout);
-
                 if (pos > 0) {
                     line[pos] = '\0';
-                    char *cmd = skip_spaces(line);
-                    rstrip_spaces(cmd);
                     
                     // Process command
-                    if (strncmp(cmd, "SET_ID ", 7) == 0) {
-                        char* new_id = cmd + 7;
+                    if (strcmp(line, "LIST") == 0) {
+                        // List all keys/values in the "unit_config" namespace
+                        nvs_iterator_t it = NULL;
+                        esp_err_t err = nvs_entry_find("nvs", "unit_config", NVS_TYPE_ANY, &it);
+                        if (err == ESP_OK) {
+                            printf("NVS contents (namespace: unit_config):\n");
+                            do {
+                                nvs_entry_info_t info;
+                                nvs_entry_info(it, &info);
+
+                                printf("  key: %s, type: %d", info.key, info.type);
+
+                                nvs_handle_t h;
+                                if (nvs_open("unit_config", NVS_READONLY, &h) == ESP_OK) {
+                                    if (info.type == NVS_TYPE_STR) {
+                                        char buf[64];
+                                        size_t sz = sizeof(buf);
+                                        if (nvs_get_str(h, info.key, buf, &sz) == ESP_OK) {
+                                            printf(", value: %s", buf);
+                                        }
+                                    } else if (info.type == NVS_TYPE_U8) {
+                                        uint8_t v;
+                                        if (nvs_get_u8(h, info.key, &v) == ESP_OK) {
+                                            printf(", value: %u", (unsigned)v);
+                                        }
+                                    } else if (info.type == NVS_TYPE_U32) {
+                                        uint32_t v;
+                                        if (nvs_get_u32(h, info.key, &v) == ESP_OK) {
+                                            printf(", value: %lu", (unsigned long)v);
+                                        }
+                                    }
+                                    nvs_close(h);
+                                }
+                                printf("\n");
+
+                                err = nvs_entry_next(&it);
+                            } while (err == ESP_OK);
+                            nvs_release_iterator(it);
+                        } else {
+                            printf("No entries found in NVS namespace 'unit_config'\n");
+                        }
+                    }
+                    else if (strncmp(line, "SET_ID ", 7) == 0) {
+                        char* new_id = line + 7;
                         esp_err_t err = write_unit_id_to_nvs(new_id);
                         if (err == ESP_OK) {
                             printf("Unit ID set to: %s\n", new_id);
-                            esp_ble_gap_set_device_name(unit_id);
-                            if (is_connected) {
-                                printf("Re-advertising new name after disconnect...\n");
-                                esp_ble_gatts_close(gatt_if_for_send, conn_id);
-                            } else {
-                                printf("Re-advertising new name now...\n");
-                                request_adv_refresh();
-                            }
                         } else {
                             printf("Error setting unit ID: %s\n", esp_err_to_name(err));
                         }
                     }
-                    else if (strcmp(cmd, "GET_ID") == 0) {
+                    else if (strcmp(line, "GET_ID") == 0) {
                         printf("Current unit ID: %s\n", unit_id);
                     }
-                    else if (strncmp(cmd, "SET_STATUS ", 11) == 0) {
-                        char *val_str = cmd + 11;
-                        uint16_t v16 = 0;
-                        if (!parse_u16_flexible(val_str, &v16)) {
-                            printf("Invalid value. Example: SET_STATUS 0x0000\n");
-                        } else {
-                            esp_err_t err = write_status_reg_to_nvs(v16);
-                            if (err == ESP_OK) {
-                                printf("status_reg set to: 0x%04X\n", (unsigned)status_reg);
-                            } else {
-                                printf("Error setting status_reg: %s\n", esp_err_to_name(err));
-                            }
-                        }
-                    }
-                    else if (strcmp(cmd, "GET_STATUS") == 0) {
-                        printf("status_reg: 0x%04X\n", (unsigned)status_reg);
-                    }
-                    else if (strncmp(cmd, "SET_PROG ", 9) == 0) {
-                        char *new_ver = cmd + 9;
-                        esp_err_t err = write_prog_version_to_nvs(new_ver);
-                        if (err == ESP_OK) {
-                            printf("prog_version set to: %s\n", prog_version);
-                        } else {
-                            printf("Error setting prog_version: %s\n", esp_err_to_name(err));
-                        }
-                    }
-                    else if (strcmp(cmd, "GET_PROG") == 0) {
-                        printf("prog_version: %s\n", prog_version);
-                    }
-                    else if (strncmp(cmd, "SET ", 4) == 0) {
-                        // Generic: SET <key>=<value>
-                        char *kv = cmd + 4;
-                        kv = skip_spaces(kv);
-                        char *eq = strchr(kv, '=');
-                        if (!eq) {
-                            printf("Invalid syntax. Example: SET status_reg=0010\n");
-                        } else {
-                            *eq = '\0';
-                            char *key = skip_spaces(kv);
-                            rstrip_spaces(key);
-                            char *val = skip_spaces(eq + 1);
-                            rstrip_spaces(val);
-
-                            if (strcmp(key, "status_reg") == 0) {
-                                uint16_t v16 = 0;
-                                if (!parse_u16_flexible(val, &v16)) {
-                                    printf("Invalid value. Example: SET status_reg=0010\n");
-                                } else {
-                                    esp_err_t err = write_status_reg_to_nvs(v16);
-                                    if (err == ESP_OK) {
-                                        printf("status_reg set to: 0x%04X\n", (unsigned)status_reg);
-                                    } else {
-                                        printf("Error setting status_reg: %s\n", esp_err_to_name(err));
-                                    }
-                                }
-                            } else if (strcmp(key, "unit_id") == 0) {
-                                esp_err_t err = write_unit_id_to_nvs(val);
-                                if (err == ESP_OK) {
-                                    printf("Unit ID set to: %s\n", unit_id);
-                                    esp_ble_gap_set_device_name(unit_id);
-                                    if (is_connected) {
-                                        printf("Re-advertising new name after disconnect...\n");
-                                        esp_ble_gatts_close(gatt_if_for_send, conn_id);
-                                    } else {
-                                        printf("Re-advertising new name now...\n");
-                                        request_adv_refresh();
-                                    }
-                                } else {
-                                    printf("Error setting unit ID: %s\n", esp_err_to_name(err));
-                                }
-                            } else if (strcmp(key, "prog_version") == 0) {
-                                esp_err_t err = write_prog_version_to_nvs(val);
-                                if (err == ESP_OK) {
-                                    printf("prog_version set to: %s\n", prog_version);
-                                } else {
-                                    printf("Error setting prog_version: %s\n", esp_err_to_name(err));
-                                }
-//////////////////new 110326////////////////////////////
-                            } else if (strcmp(key, "rx_silence_ms") == 0) {
-                                uint16_t v16 = 0;
-                                if (!parse_u16_flexible(val, &v16)) {
-                                    printf("Invalid value. Example: SET rx_silence_ms=70\n");
-                                } else {
-                                    esp_err_t err = write_rx_silence_ms_to_nvs(v16);
-                                    if (err == ESP_OK) {
-                                        printf("rx_silence_ms set to: %u\n", (unsigned)rx_silence_ms);
-                                    } else {
-                                        printf("Error setting rx_silence_ms: %s\n", esp_err_to_name(err));
-                                    }
-                                }
-///////////////////////end new///////////////////////////
-                            } else {
-                                printf("Unknown key: %s\n", key);
-                            }
-                        }
-                    }
-                    else if (strncmp(cmd, "GET ", 4) == 0) {
-                        // Generic: GET <key>
-                        char *key = skip_spaces(cmd + 4);
-                        rstrip_spaces(key);
-                        if (strcmp(key, "status_reg") == 0) {
-                            printf("status_reg: 0x%04X\n", (unsigned)status_reg);
-                        } else if (strcmp(key, "unit_id") == 0) {
-                            printf("unit_id: %s\n", unit_id);
-                        } else if (strcmp(key, "prog_version") == 0) {
-                            printf("prog_version: %s\n", prog_version);
-//////////////////new 110326////////////////////////////
-                        } else if (strcmp(key, "rx_silence_ms") == 0) {
-                            printf("rx_silence_ms: %u\n", (unsigned)rx_silence_ms);
-//////////////////////////////////////////////////////////
-                        } else {
-                            printf("Unknown key: %s\n", key);
-                        }
-                    }
-                    else if (strcmp(cmd, "LIST") == 0) {
-                        printf("NVS entries in namespace 'unit_config':\n");
-
-                        nvs_handle_t h = 0;
-                        esp_err_t open_err = nvs_open("unit_config", NVS_READONLY, &h);
-                        if (open_err != ESP_OK) {
-                            printf("  (failed to open NVS: %s)\n", esp_err_to_name(open_err));
-                        } else {
-                            nvs_iterator_t it = NULL;
-                            esp_err_t it_err = nvs_entry_find("nvs", "unit_config", NVS_TYPE_ANY, &it);
-
-                            if (it_err != ESP_OK || it == NULL) {
-                                printf("  (none)\n");
-                            } else {
-                                while (it != NULL) {
-                                    nvs_entry_info_t info;
-                                    nvs_entry_info(it, &info);
-
-                                    const char *type_str = "unknown";
-                                    switch (info.type) {
-                                        case NVS_TYPE_U8: type_str = "u8"; break;
-                                        case NVS_TYPE_I8: type_str = "i8"; break;
-                                        case NVS_TYPE_U16: type_str = "u16"; break;
-                                        case NVS_TYPE_I16: type_str = "i16"; break;
-                                        case NVS_TYPE_U32: type_str = "u32"; break;
-                                        case NVS_TYPE_I32: type_str = "i32"; break;
-                                        case NVS_TYPE_U64: type_str = "u64"; break;
-                                        case NVS_TYPE_I64: type_str = "i64"; break;
-                                        case NVS_TYPE_STR: type_str = "str"; break;
-                                        case NVS_TYPE_BLOB: type_str = "blob"; break;
-                                        default: break;
-                                    }
-
-                                    // Print value for known keys (so LIST is actually useful)
-                                    if (strcmp(info.key, "unit_id") == 0 && info.type == NVS_TYPE_STR) {
-                                        char buf[UNIT_ID_MAX_LEN] = {0};
-                                        size_t sz = sizeof(buf);
-                                        esp_err_t r = nvs_get_str(h, "unit_id", buf, &sz);
-                                        if (r == ESP_OK) {
-                                            printf("  %s (%s) = %s\n", info.key, type_str, buf);
-                                        } else {
-                                            printf("  %s (%s) = <read error: %s>\n", info.key, type_str, esp_err_to_name(r));
-                                        }
-                                    } else if (strcmp(info.key, "status_reg") == 0 && info.type == NVS_TYPE_U16) {
-                                        uint16_t v = 0;
-                                        esp_err_t r = nvs_get_u16(h, "status_reg", &v);
-                                        if (r == ESP_OK) {
-                                            printf("  %s (%s) = 0x%04X\n", info.key, type_str, (unsigned)v);
-                                        } else {
-                                            printf("  %s (%s) = <read error: %s>\n", info.key, type_str, esp_err_to_name(r));
-                                        }
-                                    } else if (strcmp(info.key, "prog_version") == 0 && info.type == NVS_TYPE_STR) {
-                                        char buf[PROG_VERSION_MAX_LEN] = {0};
-                                        size_t sz = sizeof(buf);
-                                        esp_err_t r = nvs_get_str(h, "prog_version", buf, &sz);
-                                        if (r == ESP_OK) {
-                                            printf("  %s (%s) = %s\n", info.key, type_str, buf);
-                                        } else {
-                                            printf("  %s (%s) = <read error: %s>\n", info.key, type_str, esp_err_to_name(r));
-                                        }
-//////////////////new 110326////////////////////////////
-
-                                    } else if (strcmp(info.key, "rx_silence_ms") == 0 && info.type == NVS_TYPE_U16) {
-                                        uint16_t v = 0;
-                                        esp_err_t r = nvs_get_u16(h, "rx_silence_ms", &v);
-                                        if (r == ESP_OK) {
-                                            printf("  %s (%s) = %u\n", info.key, type_str, (unsigned)v);
-                                        } else {
-                                            printf("  %s (%s) = <read error: %s>\n", info.key, type_str, esp_err_to_name(r));
-                                        }
-///////////////////////////end new///////////////////////////
-                                    } else {
-                                        printf("  %s (%s)\n", info.key, type_str);
-                                    }
-
-                                    // Advance iterator; when finished it will set it to NULL
-                                    if (nvs_entry_next(&it) != ESP_OK) {
-                                        break;
-                                    }
-                                }
-                            }
-
-                            // NOTE: With the nvs_entry_next(&it) API, the iterator storage is managed
-                            // by the NVS iterator functions; releasing here can double-free on some IDF versions.
-                            // If we broke out early and still have a non-NULL iterator, release it.
-                            if (it != NULL) {
-                                nvs_release_iterator(it);
-                            }
-                            nvs_close(h);
-                        }
-                    }
-                    else if (strcmp(cmd, "HELP") == 0) {
+                    else if (strcmp(line, "HELP") == 0) {
                         printf("Available commands:\n");
                         printf("  SET_ID <unit_id>  - Program unit ID\n");
                         printf("  GET_ID           - Show current unit ID\n");
-                        printf("  SET_STATUS <val> - Set status_reg (e.g. 0x1234 or 4660)\n");
-                        printf("  GET_STATUS       - Show status_reg\n");
-                        printf("  SET <key>=<val>  - Generic set (unit_id, status_reg)\n");
-                        printf("  GET <key>        - Generic get (unit_id, status_reg)\n");
-                        printf("  LIST             - List keys in NVS namespace unit_config\n");
                         printf("  HELP             - Show this help\n");
                     }
-                    else if (strlen(cmd) > 0) {
-                        printf("Unknown command: %s (type HELP for commands)\n", cmd);
+                    else if (strlen(line) > 0) {
+                        printf("Unknown command: %s (type HELP for commands)\n", line);
                     }
                     
                     pos = 0;
@@ -1775,38 +1249,47 @@ void serial_command_task(void *arg) {
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
-
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 void app_main(void) 
 {
 
-   // ESP_LOGI(TAG, "=== BLE app_main STARTING ===");
+   // ESP_LOGI(TAG, "=== BLE APPLICATION STARTING ===");
+
+    // Configure Task Watchdog Timer timeout
+    // Task Watchdog Timer is auto-initialized by ESP-IDF (CONFIG_ESP_TASK_WDT_INIT=y)
+    // Reconfigure it to use our custom timeout value
+    ESP_LOGI(TAG, "Configuring Task Watchdog Timer to %d seconds...", WATCHDOG_TIMEOUT_SECONDS);
+    esp_task_wdt_config_t wdt_config = {
+        .timeout_ms = WATCHDOG_TIMEOUT_SECONDS * 1000,  // Convert seconds to milliseconds
+        .idle_core_mask = 0,  // Monitor all cores (0 = all cores)
+        .trigger_panic = true  // Trigger panic on timeout (system will reboot)
+    };
+    
+    esp_err_t wdt_config_ret = esp_task_wdt_reconfigure(&wdt_config);
+    if (wdt_config_ret == ESP_OK) {
+        ESP_LOGI(TAG, "Watchdog timeout configured to %d seconds successfully", WATCHDOG_TIMEOUT_SECONDS);
+    } else if (wdt_config_ret == ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "Watchdog not initialized yet - will use default timeout");
+    } else {
+        ESP_LOGW(TAG, "Failed to reconfigure watchdog: %s (using default timeout)", esp_err_to_name(wdt_config_ret));
+    }
+    
+    // Add main task to watchdog monitoring
+    ESP_LOGI(TAG, "Registering main task with Task Watchdog Timer...");
+    esp_err_t wdt_ret = esp_task_wdt_add(NULL);
+    if (wdt_ret == ESP_OK) {
+        ESP_LOGI(TAG, "Main task registered with watchdog successfully");
+    } else if (wdt_ret == ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "Watchdog not initialized - will be initialized automatically");
+    } else {
+        ESP_LOGW(TAG, "Failed to add main task to watchdog: %s (may be auto-initialized later)", esp_err_to_name(wdt_ret));
+    }
 
     ESP_ERROR_CHECK(nvs_flash_init());
 
-    // Load unit ID from NVS before any BLE/encryption logic uses it
-#if USE_DYNAMIC_UNIT_ID
+    // Load or initialize unit ID from NVS before BLE name/encryption are set
     load_unit_configuration();
-#endif
 
-    // Load status_reg from NVS (always)
-    load_status_reg();
-
-    // Load program version from NVS (always)
-    load_prog_version();
-///////////////////////new 110326///////////////////////
-    // Load RX silence framing configuration (always)
-    load_rx_silence_ms();
-
-    if (rx_buf_mutex == NULL) {
-        rx_buf_mutex = xSemaphoreCreateMutex();
-    }
-    if (rx_finalize_task_handle == NULL) {
-        xTaskCreate(rx_finalize_task, "rx_finalize", 4096, NULL, 6, &rx_finalize_task_handle);
-    }
-    if (rx_silence_timer == NULL) {
-        rx_silence_timer = xTimerCreate("rx_silence", pdMS_TO_TICKS(1000), pdFALSE, NULL, rx_silence_timer_cb);
-    }
-////////////////////////////end new////////////////////////////////
     ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT));
     esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_bt_controller_init(&bt_cfg));
@@ -1867,28 +1350,13 @@ void app_main(void)
             ESP_LOGI(TAG, "Relay control system started successfully at startup");
             relay_system_initialized = true;
 
-            // Status LED: blink when advertising, steady on when connected (all units)
-            gpio_reset_pin(LED_GPIO);
-            gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT);
-            gpio_set_level(LED_GPIO, 0);
-
-            if (status_led_task_handle == NULL) {
-                BaseType_t res = xTaskCreate(
-                    status_led_task,
-                    "status_led",
-                    1536,
-                    NULL,
-                    5,
-                    &status_led_task_handle
-                );
-                if (res != pdPASS) {
-                    ESP_LOGE(TAG, "Failed to create status LED task");
-                    status_led_task_handle = NULL;
-                }
-            }
-
-            // For manual-hold units, start monitor task (relay timeout / keepalive)
+            // For manual-hold units, configure LED and start monitor task
             if (manual_mode_unit && manual_monitor_task_handle == NULL) {
+                // Configure GPIO 23 (on-board LED) as output for relay-active indicator
+                gpio_reset_pin(LED_GPIO);
+                gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT);
+                gpio_set_level(LED_GPIO, 0);
+
                 BaseType_t res = xTaskCreate(
                     manual_monitor_task,
                     "manual_hold_mon",
@@ -1909,16 +1377,23 @@ void app_main(void)
 //----------------------------------------------------------------------------
     // Notification task will be started automatically when:
     // 1. Client connects AND 2. Client enables notifications
-    ESP_LOGI(TAG, "BLE server %s initialized (prog_version=%s)...", unit_id_to_use, prog_version);
+    ESP_LOGI(TAG, "BLE GATT server initialized. Waiting for connections...");
+    
     // Relay system will be initialized on first BLE connection to avoid boot conflicts
+  
+     //=====================serial input command=======================
+    // Start serial input command processor for NVS programming (if needed)
 
-    // Serial monitor: NVS commands (SET_ID, GET_ID, HELP)
-
-   
     xTaskCreate(serial_command_task, "serial_cmd", 3072, NULL, 3, NULL);
+   
+    // Show initial prompt for serial commands
 
     vTaskDelay(pdMS_TO_TICKS(100));  // Let logs settle
-    printf("nvs> ");
-    fflush(stdout);
-
+    printf("NVS > ");
+    fflush(stdout); 
+    
+    ESP_LOGI(TAG, "System initialization complete. Watchdog active.");
+    
+    // app_main can return - FreeRTOS will continue running via tasks
+    // All tasks are registered with watchdog and will feed it periodically
 }

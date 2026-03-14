@@ -6,10 +6,8 @@
 #include "esp_err.h"
 
 // Configuration
-
 // Uncomment to use non-latching relays (single control pin per relay)
 #define NON_LATCH
-
 // Uncomment if relay module is active-LOW (LOW = on, HIGH = off) - try if relays don't activate
 // #define RELAY_ACTIVE_LOW
 
