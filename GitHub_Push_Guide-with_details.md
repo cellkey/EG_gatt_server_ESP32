@@ -144,7 +144,7 @@ git push
 | Add remote (once)  | `git remote add origin https://github.com/cellkey/EG_gatt_server_ESP32.git
 | First push        | `git branch -M main` then `git push -u origin main` |
 | Later pushes      | `git push` |
-
+  add new branch    | git push --set-upstream origin branch_140326
 ---
 
 ## Notes
