@@ -32,13 +32,20 @@ Eli - Continuas relay activation. Led blinks while relay is active.
 
 // On-board LED: status indicator — blink when advertising, steady on when connected
 
-#define LED_GPIO         23  //little board configuration
-/* #efine LED_GPIO       21 //  //Eli board configuration */
+ #define LED_GPIO      23  // little board configuration
+//#define LED_GPIO         5 //  Eli big board configuration -check polarity
 
 #define LED_BLINK_MS     500
+// LED polarity: 1 = active-high, 0 = active-low
+#define LED_ACTIVE_LEVEL 1
+#define LED_INACTIVE_LEVEL (1 - LED_ACTIVE_LEVEL)
 
 // App does not require per-command ACK notifications
 #define SEND_ACK_NOTIFICATIONS 0
+
+// App is not yet ready for JSON-result notifications from relay commands
+// 0 = disable (current behavior), 1 = enable "Message OK"/error notifications
+#define SEND_JSON_RESULT_NOTIFICATIONS 0
 
 // Disable per-fragment RX logging (too noisy)
 #define LOG_RX_FRAGMENTS 0
@@ -49,9 +56,12 @@ static bool relay_system_initialized = false;
 // Configuration: Set to 1 for dynamic unit ID (read from NVS), 0 for hardcoded name
 #define USE_DYNAMIC_UNIT_ID 1
 
+// Disconnect client after relay activation: 1 = current behavior (disconnect immediately), 0 = let app disconnect (test)
+#define DISCONNECT_AFTER_RELAY_ACTIVATION 0
+
 // Default unit ID for hardcoded mode
 //#define DEFAULT_UNIT_ID "cr16061952"
-#define DEFAULT_UNIT_ID "cr16061992"  //sport Alonim
+#define DEFAULT_UNIT_ID "cr16061952"  //sport Alonim
 //#define DEFAULT_UNIT_ID "cr17061949"  //Eli's unit ID
 
 // Function declarations
@@ -132,6 +142,8 @@ static bool manual_relay1_on = false;
 static bool manual_relay2_on = false;
 static TickType_t last_manual_msg_tick = 0;  // Last time we saw UP/DOWN traffic
 static bool manual_keepalive_received = false;  // True after first raw UP/DOWN keepalive
+static bool manual_forced_active = false;        // If true, session ends after forced end tick
+static TickType_t manual_forced_end_tick = 0;    // Tick when forced session must end
 static TaskHandle_t manual_monitor_task_handle = NULL;
 static TaskHandle_t status_led_task_handle = NULL;
 static TickType_t last_led_toggle_tick = 0;    // For status LED blink when advertising
@@ -358,7 +370,7 @@ static void load_prog_version(void)
     // If not present (or read failed), ensure we have a defined default in NVS too.
     write_prog_version_to_nvs(prog_version);
 }
-//////////////////////new 110326//////////////////
+
 static esp_err_t read_rx_silence_ms_from_nvs(uint16_t *out_value)
 {
     if (!out_value) return ESP_ERR_INVALID_ARG;
@@ -417,7 +429,7 @@ static void load_rx_silence_ms(void)
     // If not present (or read failed), ensure we have a defined default in NVS too.
     write_rx_silence_ms_to_nvs(rx_silence_ms);
 }
-/////////////////end of new/////////////////////////////////////
+
 static char *skip_spaces(char *s)
 {
     while (s && *s && isspace((unsigned char)*s)) s++;
@@ -467,6 +479,38 @@ static bool parse_u16_flexible(const char *s, uint16_t *out)
     return true;
 }
 
+// Manual-mode helper:
+// Parse optional duration seconds from JSON like:
+//   "i":["up",10]  or  "h":["down",10]
+// Returns 0 when not present or invalid. Clamps to uint16_t max seconds.
+static uint16_t manual_parse_optional_duration_seconds(const char *json, const char *field_key, const char *field_value)
+{
+    if (!json || !field_key || !field_value) return 0;
+
+    // Find the field key first (e.g. "\"i\":[")
+    const char *k = strstr(json, field_key);
+    if (!k) return 0;
+
+    // Find the value token within the array (e.g. "\"up\"")
+    const char *v = strstr(k, field_value);
+    if (!v) return 0;
+
+    // Move to the first char after the value token
+    v += strlen(field_value);
+    while (*v == ' ' || *v == '\t' || *v == '\r' || *v == '\n') v++;
+
+    if (*v != ',') return 0;  // no duration provided
+    v++; // skip comma
+    while (*v == ' ' || *v == '\t' || *v == '\r' || *v == '\n') v++;
+
+    char *endp = NULL;
+    long sec = strtol(v, &endp, 10);
+    if (endp == v) return 0; // no number
+    if (sec <= 0) return 0;  // 0 means "normal hold mode"
+    if (sec > 0xFFFFL) sec = 0xFFFFL;
+    return (uint16_t)sec;
+}
+
 void load_unit_configuration(void) {
     // Try to load unit ID from NVS
     if (read_unit_id_from_nvs(unit_id, UNIT_ID_MAX_LEN) != ESP_OK) {
@@ -501,9 +545,32 @@ static void manual_monitor_task(void *arg)
         // 1) Keepalives received then stopped (500ms gap) - user released
         // 2) NO keepalive ever (700ms) - user released immediately, MUST deactivate!
         if (manual_mode_unit && manual_session_active) {
-            TickType_t elapsed = now - last_manual_msg_tick;
-            TickType_t threshold = manual_keepalive_received ? timeout_ticks : no_keepalive_ticks;
-            if (elapsed > threshold) {
+            // Forced-duration mode: always end the session at the requested time
+            // Wrap-safe tick comparison: elapsed >= 0 means now has reached end tick.
+            if (manual_forced_active && (int32_t)(now - manual_forced_end_tick) >= 0) {
+                ESP_LOGI(TAG, "Manual forced-duration expired - releasing relays and disconnecting BLE");
+
+                relay_command_t cmd = {0};
+                cmd.relay_number = 3;       // both relays
+                cmd.duration_ms = 0;
+                cmd.activate = false;
+                snprintf(cmd.description, sizeof(cmd.description), "Manual forced end");
+                relay_execute_command(&cmd);
+
+                manual_relay1_on = false;
+                manual_relay2_on = false;
+                manual_session_active = false;
+                manual_keepalive_received = false;
+                manual_forced_active = false;
+                manual_forced_end_tick = 0;
+
+                if (is_connected) {
+                    esp_ble_gatts_close(gatt_if_for_send, conn_id);
+                }
+            } else if (!manual_forced_active) {
+                TickType_t elapsed = now - last_manual_msg_tick;
+                TickType_t threshold = manual_keepalive_received ? timeout_ticks : no_keepalive_ticks;
+                if (elapsed > threshold) {
                 uint32_t elapsed_ms = pdTICKS_TO_MS(elapsed);
                 ESP_LOGI(TAG, "Manual hold timeout after %" PRIu32 " ms - releasing relays and disconnecting BLE", elapsed_ms);
 
@@ -519,10 +586,13 @@ static void manual_monitor_task(void *arg)
                 manual_relay2_on = false;
                 manual_session_active = false;
                 manual_keepalive_received = false;
+                manual_forced_active = false;
+                manual_forced_end_tick = 0;
 
                 // Close connection if still up
                 if (is_connected) {
                     esp_ble_gatts_close(gatt_if_for_send, conn_id);
+                }
                 }
             }
         }
@@ -540,14 +610,15 @@ static void status_led_task(void *arg)
         TickType_t now = xTaskGetTickCount();
 
         if (is_connected) {
-            gpio_set_level(LED_GPIO, 1);   // Steady on when connected
+            gpio_set_level(LED_GPIO, LED_ACTIVE_LEVEL);   // Steady on when connected
             led_state = true;
         } else {
             // Advertising: blink every LED_BLINK_MS
             TickType_t elapsed_led = now - last_led_toggle_tick;
             if (elapsed_led >= pdMS_TO_TICKS(LED_BLINK_MS)) {
                 led_state = !led_state;
-                gpio_set_level(LED_GPIO, led_state ? 1 : 0);
+                gpio_set_level(LED_GPIO, led_state ? LED_ACTIVE_LEVEL : LED_INACTIVE_LEVEL);
+               
                 last_led_toggle_tick = now;
             }
         }
@@ -709,7 +780,7 @@ esp_err_t ble_send_notification(const char* message, bool is_response)
    // ESP_LOGI(TAG, "Queued notification: %s", message);
     return ESP_OK;
 }
-//////////////new 110326//////////////////////////////////////
+
 static void rx_finalize_task(void *arg)
 {
     (void)arg;
@@ -782,7 +853,7 @@ static void rx_silence_timer_cb(TimerHandle_t xTimer)
         xTaskNotifyGive(rx_finalize_task_handle);
     }
 }
-//////////////////////////end new////////////////////////////////
+
 // Start the notification task (called when BLE connects and notifications enabled)
 esp_err_t start_notification_service(void)
 {
@@ -934,13 +1005,12 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
             break;
 
         case ESP_GAP_BLE_ADV_START_COMPLETE_EVT:
-            ESP_LOGI(TAG, "Advertising started.\n\r             ------------------------------------");
+            ESP_LOGI(TAG, "Advertising started.\n\r------------------------------------");
             break;
         default:
             break;
     } 
 }
-
 
 
 
@@ -1036,6 +1106,8 @@ static void gatts_event_handler(esp_gatts_cb_event_t event,
             manual_relay1_on = false;
             manual_relay2_on = false;
             manual_keepalive_received = false;
+            manual_forced_active = false;
+            manual_forced_end_tick = 0;
             
             // Stop all services when disconnected
             stop_connection_timeout();
@@ -1051,8 +1123,6 @@ static void gatts_event_handler(esp_gatts_cb_event_t event,
 
         if (param->write.handle == char1_handle) 
         {
-//////////////////new 110326////////////////////////////
-
             // Log safely (bounded to this fragment only)
 #if LOG_RX_FRAGMENTS
             int len = param->write.len;
@@ -1061,7 +1131,6 @@ static void gatts_event_handler(esp_gatts_cb_event_t event,
                      (len > 0 ? (char)val[len - 1] : '?'),
                      (memchr(val, '#', len) != NULL));
 #endif
-////////////////////end new////////////////////////
 
             // ---------------- Eli unit -Manual UP/DOWN hold mode handling ----------------
             // Check for raw UP/DOWN keepalive messages (without # terminator) in manual mode
@@ -1089,6 +1158,8 @@ static void gatts_event_handler(esp_gatts_cb_event_t event,
                         manual_relay2_on = false;
                         manual_session_active = false;
                         manual_keepalive_received = false;
+                        manual_forced_active = false;
+                        manual_forced_end_tick = 0;
                         if (is_connected) {
                             esp_ble_gatts_close(gatt_if_for_send, conn_id);
                         }
@@ -1132,6 +1203,8 @@ static void gatts_event_handler(esp_gatts_cb_event_t event,
                         manual_relay2_on = false;
                         manual_session_active = false;
                         manual_keepalive_received = false;
+                        manual_forced_active = false;
+                        manual_forced_end_tick = 0;
                         if (is_connected) {
                             esp_ble_gatts_close(gatt_if_for_send, conn_id);
                         }
@@ -1234,13 +1307,21 @@ static void gatts_event_handler(esp_gatts_cb_event_t event,
                     //    {"e":["AT6802H"],"i":["up"]}#  -> start/hold Relay 1 (or keepalive if already active)
                     //    {"e":["AT6802H"],"h":["down"]}# -> start/hold Relay 2 (or keepalive if already active)
                     if (strstr(message_buffer, encrypted_data) != NULL) {
-                        if (strstr(message_buffer, "\"i\":[\"up\"]") != NULL) {
+                        // Accept both formats:
+                        //   "i":["up"]
+                        //   "i":["up",10]
+                        if (strstr(message_buffer, "\"i\":[\"up\"") != NULL) {
                             if (manual_session_active) {
                                 // Already in session - treat as keepalive (update timestamp only)
                                 last_manual_msg_tick = now;
                                 handled_manual = true;
                             } else {
                                 ESP_LOGI(TAG, "Manual mode: initial UP command (relay 1)");
+                                uint16_t forced_sec = manual_parse_optional_duration_seconds(
+                                    message_buffer,
+                                    "\"i\":[",
+                                    "\"up\""
+                                );
 
                                 relay_command_t cmd = {0};
                                 cmd.relay_number = 2;  // Deactivate relay 2 first - only one relay active at a time
@@ -1258,15 +1339,28 @@ static void gatts_event_handler(esp_gatts_cb_event_t event,
                                 manual_relay2_on = false;
                                 last_manual_msg_tick = now;
                                 manual_keepalive_received = false;  // Wait for first raw keepalive
+                                if (forced_sec > 0) {
+                                    manual_forced_active = true;
+                                    manual_forced_end_tick = now + pdMS_TO_TICKS((uint32_t)forced_sec * 1000UL);
+                                    ESP_LOGI(TAG, "Manual UP: forced duration %u seconds", (unsigned)forced_sec);
+                                } else {
+                                    manual_forced_active = false;
+                                    manual_forced_end_tick = 0;
+                                }
                                 handled_manual = true;
                             }
-                        } else if (strstr(message_buffer, "\"h\":[\"down\"]") != NULL) {
+                        } else if (strstr(message_buffer, "\"h\":[\"down\"") != NULL) {
                             if (manual_session_active) {
                                 // Already in session - treat as keepalive (update timestamp only)
                                 last_manual_msg_tick = now;
                                 handled_manual = true;
                             } else {
                                 ESP_LOGI(TAG, "Manual mode: initial DOWN command (relay 2)");
+                                uint16_t forced_sec = manual_parse_optional_duration_seconds(
+                                    message_buffer,
+                                    "\"h\":[",
+                                    "\"down\""
+                                );
 
                                 relay_command_t cmd = {0};
                                 cmd.relay_number = 1;  // Deactivate relay 1 first - only one relay active at a time
@@ -1284,6 +1378,14 @@ static void gatts_event_handler(esp_gatts_cb_event_t event,
                                 manual_relay2_on = true;
                                 last_manual_msg_tick = now;
                                 manual_keepalive_received = false;  // Wait for first raw keepalive
+                                if (forced_sec > 0) {
+                                    manual_forced_active = true;
+                                    manual_forced_end_tick = now + pdMS_TO_TICKS((uint32_t)forced_sec * 1000UL);
+                                    ESP_LOGI(TAG, "Manual DOWN: forced duration %u seconds", (unsigned)forced_sec);
+                                } else {
+                                    manual_forced_active = false;
+                                    manual_forced_end_tick = 0;
+                                }
                                 handled_manual = true;
                             }
                         }
@@ -1390,36 +1492,50 @@ static void gatts_event_handler(esp_gatts_cb_event_t event,
                     esp_err_t exec_result = relay_execute_command(&pending_relay_cmd);
                     if (exec_result == ESP_OK) {
                         ESP_LOGI(TAG, "Relay command executed successfully");
+#if SEND_JSON_RESULT_NOTIFICATIONS
+                        ble_send_notification("Message OK", true);
+#endif
                     } else {
                         ESP_LOGE(TAG, "Failed to execute relay command: %s", esp_err_to_name(exec_result));
+#if SEND_JSON_RESULT_NOTIFICATIONS
+                        ble_send_notification("Relay error", true);
+#endif
                     }
                 } else {
                     ESP_LOGW(TAG, "Failed to parse relay command: %s", esp_err_to_name(parse_result));
+#if SEND_JSON_RESULT_NOTIFICATIONS
+                    ble_send_notification("Parse error", true);
+#endif
                 }
                 
-                // Disconnect client after relays are active (lower priority - shortens time to activation)
+                // Disconnect client after relays are active (optional: set DISCONNECT_AFTER_RELAY_ACTIVATION to 1 to restore)
+#if DISCONNECT_AFTER_RELAY_ACTIVATION
                 ESP_LOGI(TAG, "Disconnecting client..");
                 esp_ble_gatts_close(gatt_if_for_send, conn_id);
-                
+#else
+                ESP_LOGI(TAG, "Relays active - client may disconnect when ready");
+#endif
             } else {
                 // Invalid command - reject
                 ESP_LOGW(TAG, "Unauthorized message-rejected");
                 ESP_LOGW(TAG, "Expected: %s, but message contains: %s", encrypted_data, message_buffer);
                 snprintf(response, sizeof(response), "AUTH_ERROR");
+#if SEND_JSON_RESULT_NOTIFICATIONS
+                ble_send_notification(response, true);
+#endif
             }   
                 
                 // Reset buffer for next message
                 message_index = 0;
                 memset(message_buffer, 0, MSG_BUF_LEN);
-//////////////////new 110326////////////////////////////
+
                 if (rx_mutex_taken) {
                     xSemaphoreGive(rx_buf_mutex);
                     rx_mutex_taken = false;
                 }
-//////////////////////end new//////////////////////////
                 break;  // Exit loop after processing complete message
             }
-//////////////////new 110326////////////////////////////
+
         // If we didn't see '#', optionally finalize after silence window (ATMEGA-style framing)
         if (!saw_hash && rx_silence_timer && rx_silence_ms > 0) {
             // Restart one-shot timer on every fragment; finalize if line goes silent.
@@ -1434,7 +1550,6 @@ static void gatts_event_handler(esp_gatts_cb_event_t event,
             xSemaphoreGive(rx_buf_mutex);
             rx_mutex_taken = false;
         }
-/////////////////////////end new////////////////////////
         }
         }
 
@@ -1613,7 +1728,6 @@ void serial_command_task(void *arg) {
                                 } else {
                                     printf("Error setting prog_version: %s\n", esp_err_to_name(err));
                                 }
-//////////////////new 110326////////////////////////////
                             } else if (strcmp(key, "rx_silence_ms") == 0) {
                                 uint16_t v16 = 0;
                                 if (!parse_u16_flexible(val, &v16)) {
@@ -1626,7 +1740,6 @@ void serial_command_task(void *arg) {
                                         printf("Error setting rx_silence_ms: %s\n", esp_err_to_name(err));
                                     }
                                 }
-///////////////////////end new///////////////////////////
                             } else {
                                 printf("Unknown key: %s\n", key);
                             }
@@ -1642,10 +1755,8 @@ void serial_command_task(void *arg) {
                             printf("unit_id: %s\n", unit_id);
                         } else if (strcmp(key, "prog_version") == 0) {
                             printf("prog_version: %s\n", prog_version);
-//////////////////new 110326////////////////////////////
                         } else if (strcmp(key, "rx_silence_ms") == 0) {
                             printf("rx_silence_ms: %u\n", (unsigned)rx_silence_ms);
-//////////////////////////////////////////////////////////
                         } else {
                             printf("Unknown key: %s\n", key);
                         }
@@ -1710,8 +1821,6 @@ void serial_command_task(void *arg) {
                                         } else {
                                             printf("  %s (%s) = <read error: %s>\n", info.key, type_str, esp_err_to_name(r));
                                         }
-//////////////////new 110326////////////////////////////
-
                                     } else if (strcmp(info.key, "rx_silence_ms") == 0 && info.type == NVS_TYPE_U16) {
                                         uint16_t v = 0;
                                         esp_err_t r = nvs_get_u16(h, "rx_silence_ms", &v);
@@ -1720,7 +1829,6 @@ void serial_command_task(void *arg) {
                                         } else {
                                             printf("  %s (%s) = <read error: %s>\n", info.key, type_str, esp_err_to_name(r));
                                         }
-///////////////////////////end new///////////////////////////
                                     } else {
                                         printf("  %s (%s)\n", info.key, type_str);
                                     }
@@ -1779,7 +1887,7 @@ void serial_command_task(void *arg) {
 void app_main(void) 
 {
 
-   // ESP_LOGI(TAG, "=== BLE app_main STARTING ===");
+   // ESP_LOGI(TAG, "=== BLE APPLICATION STARTING ===");
 
     ESP_ERROR_CHECK(nvs_flash_init());
 
@@ -1793,7 +1901,7 @@ void app_main(void)
 
     // Load program version from NVS (always)
     load_prog_version();
-///////////////////////new 110326///////////////////////
+
     // Load RX silence framing configuration (always)
     load_rx_silence_ms();
 
@@ -1806,7 +1914,7 @@ void app_main(void)
     if (rx_silence_timer == NULL) {
         rx_silence_timer = xTimerCreate("rx_silence", pdMS_TO_TICKS(1000), pdFALSE, NULL, rx_silence_timer_cb);
     }
-////////////////////////////end new////////////////////////////////
+
     ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT));
     esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_bt_controller_init(&bt_cfg));
@@ -1871,10 +1979,10 @@ void app_main(void)
             gpio_reset_pin(LED_GPIO);
             gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT);
             gpio_set_level(LED_GPIO, 0);
+          
 
             if (status_led_task_handle == NULL) {
-                BaseType_t res = xTaskCreate(
-                    status_led_task,
+                BaseType_t res = xTaskCreate(                    status_led_task,
                     "status_led",
                     1536,
                     NULL,

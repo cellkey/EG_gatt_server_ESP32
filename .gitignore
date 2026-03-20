@@ -1,5 +1,7 @@
 # ESP-IDF Build files
 build/
+BU/
+tutorial/
 sdkconfig.old
 *.pyc
 __pycache__/

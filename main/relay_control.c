@@ -20,6 +20,7 @@ Define NON_LATCH to use non-latching relays (single pin per relay). */
 
 // GPIO pin assignments for relays
 // Latching relays use SET/RESET pairs; non-latching uses only set_pin
+
 typedef struct {
     gpio_num_t set_pin;    // Pin to activate (SET) the relay
     gpio_num_t reset_pin;  // Pin to deactivate (RESET) the relay
@@ -29,12 +30,15 @@ static const relay_pins_t relay_pins[2] = {  // Only 2 relays
    // {GPIO_NUM_6, GPIO_NUM_7},   // Latch Relay 1: SET=GPIO6, RESET=GPIO7 ???
   //  {GPIO_NUM_8, GPIO_NUM_9}    // Latch Relay 2: SET=GPIO8, RESET=GPIO9  ???
 
-    {GPIO_NUM_16, GPIO_NUM_16},   // Relay 1: SET=GPI16, RESET=GPI16 -- small ESP32 board
-   {GPIO_NUM_17, GPIO_NUM_17}    // Relay 2: SET=GPIO8, RESET=GPI17 -- small ESP32 board
-
-   //  {GPIO_NUM_12, GPIO_NUM_12},   // Relay 1: SET=GPIO6, RESET=GPIO7 - Eli new ESP32 board
-   //  {GPIO_NUM_13, GPIO_NUM_13}    // Relay 2: SET=GPIO8, RESET=GPIO9  -Eli new ESP32 board
-
+    //small ESP32 board
+     {GPIO_NUM_16, GPIO_NUM_16},   // Relay 1: SET=GPI16, RESET=GPI16 -- new small ESP32 board
+     {GPIO_NUM_17, GPIO_NUM_17}    // Relay 2: SET=GPIO8, RESET=GPI17 -- new small ESP32 board 
+   
+/* 
+    //Eli big ESP32 board
+     {GPIO_NUM_12, GPIO_NUM_12},   // Relay 1: SET=GPIO6, RESET=GPIO7 - Eli new big ESP32 board
+     {GPIO_NUM_13, GPIO_NUM_13}    // Relay 2: SET=GPIO8, RESET=GPIO9  -Eli new big ESP32 board
+ */
 };
 
 #ifndef NON_LATCH
