@@ -765,6 +765,7 @@ esp_err_t ble_send_notification(const char* message, bool is_response)
         return ESP_ERR_INVALID_STATE;
     }
 
+    
     notification_msg_t msg;
     strncpy(msg.message, message, MSG_BUF_LEN - 1);
     msg.message[MSG_BUF_LEN - 1] = '\0';  // Ensure null termination
