@@ -130,7 +130,7 @@ static uint16_t status_reg = 0x0000;
 
 // Program version stored in NVS (namespace: unit_config, key: prog_version)
 #define PROG_VERSION_MAX_LEN 16
-static char prog_version[PROG_VERSION_MAX_LEN] = "0.0.0";
+static char prog_version[PROG_VERSION_MAX_LEN] = "3.8.0";
 
 #define MANUAL_MODE_TIMEOUT_MS 350   // Timeout after first keepalive (gap between keepalives)
 #define MANUAL_MODE_NO_KEEPALIVE_MS 700  // Timeout when NO keepalive ever (button released immediately) - SAFETY
@@ -243,58 +243,31 @@ esp_err_t write_unit_id_to_nvs(const char* new_unit_id) {
     return err;
 }
 
-static esp_err_t read_prog_version_from_nvs(char *buffer, size_t max_len)
+// prog_version is compile-time only (do not store in NVS).
+// If an old "prog_version" key exists in NVS from earlier firmware, we erase it at boot
+// so LIST/GET won't show stale versions.
+static void clear_prog_version_key_from_nvs(void)
 {
-    if (!buffer || max_len == 0) return ESP_ERR_INVALID_ARG;
-
-    nvs_handle_t nvs_handle;
-    esp_err_t err = nvs_open("unit_config", NVS_READONLY, &nvs_handle);
+    nvs_handle_t h = 0;
+    esp_err_t err = nvs_open("unit_config", NVS_READWRITE, &h);
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to open NVS for reading prog_version: %s", esp_err_to_name(err));
-        return err;
+        ESP_LOGW(TAG, "Failed to open NVS to clear prog_version: %s", esp_err_to_name(err));
+        return;
     }
 
-    size_t required_size = max_len;
-    err = nvs_get_str(nvs_handle, "prog_version", buffer, &required_size);
-    nvs_close(nvs_handle);
-
+    err = nvs_erase_key(h, "prog_version");
     if (err == ESP_OK) {
-        ESP_LOGI(TAG, "prog_version loaded from NVS: %s", buffer);
-    } else if (err == ESP_ERR_NVS_NOT_FOUND) {
-        ESP_LOGW(TAG, "prog_version not found in NVS, using default %s", prog_version);
-    } else {
-        ESP_LOGE(TAG, "Error reading prog_version: %s", esp_err_to_name(err));
-    }
-
-    return err;
-}
-
-static esp_err_t write_prog_version_to_nvs(const char *new_ver)
-{
-    if (!new_ver || strlen(new_ver) == 0 || strlen(new_ver) >= PROG_VERSION_MAX_LEN) {
-        ESP_LOGE(TAG, "Invalid prog_version for writing");
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    nvs_handle_t nvs_handle;
-    esp_err_t err = nvs_open("unit_config", NVS_READWRITE, &nvs_handle);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to open NVS for writing prog_version: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    err = nvs_set_str(nvs_handle, "prog_version", new_ver);
-    if (err == ESP_OK) {
-        err = nvs_commit(nvs_handle);
-        if (err == ESP_OK) {
-            strncpy(prog_version, new_ver, PROG_VERSION_MAX_LEN - 1);
-            prog_version[PROG_VERSION_MAX_LEN - 1] = '\0';
-            ESP_LOGI(TAG, "prog_version saved to NVS: %s", prog_version);
+        esp_err_t c = nvs_commit(h);
+        if (c == ESP_OK) {
+            ESP_LOGI(TAG, "Cleared stale NVS key: prog_version");
+        } else {
+            ESP_LOGW(TAG, "Failed to commit prog_version erase: %s", esp_err_to_name(c));
         }
+    } else if (err != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGW(TAG, "Failed to erase prog_version: %s", esp_err_to_name(err));
     }
 
-    nvs_close(nvs_handle);
-    return err;
+    nvs_close(h);
 }
 
 static esp_err_t read_status_reg_from_nvs(uint16_t *out_value)
@@ -360,15 +333,8 @@ static void load_status_reg(void)
 
 static void load_prog_version(void)
 {
-    char buf[PROG_VERSION_MAX_LEN] = {0};
-    if (read_prog_version_from_nvs(buf, sizeof(buf)) == ESP_OK) {
-        strncpy(prog_version, buf, PROG_VERSION_MAX_LEN - 1);
-        prog_version[PROG_VERSION_MAX_LEN - 1] = '\0';
-        return;
-    }
-
-    // If not present (or read failed), ensure we have a defined default in NVS too.
-    write_prog_version_to_nvs(prog_version);
+    // Keep compiled prog_version value and clear any old persisted key.
+    clear_prog_version_key_from_nvs();
 }
 
 static esp_err_t read_rx_silence_ms_from_nvs(uint16_t *out_value)
@@ -514,17 +480,24 @@ static uint16_t manual_parse_optional_duration_seconds(const char *json, const c
 void load_unit_configuration(void) {
     // Try to load unit ID from NVS
     if (read_unit_id_from_nvs(unit_id, UNIT_ID_MAX_LEN) != ESP_OK) {
-        // Fallback: Generate MAC-based ID
-        uint8_t mac[6];
-        esp_err_t ret = esp_read_mac(mac, ESP_MAC_WIFI_STA);
-        if (ret == ESP_OK) {
-            snprintf(unit_id, UNIT_ID_MAX_LEN, "EG%02X%02X%02X", mac[3], mac[4], mac[5]);
-            ESP_LOGI(TAG, "Generated MAC-based unit ID: %s", unit_id);
-            // Save the generated ID for next boot
-            write_unit_id_to_nvs(unit_id);
-        } else {
-            // Keep default DEFAULT_UNIT_ID if everything fails
-            ESP_LOGW(TAG, "Using hardcoded default unit ID: %s", unit_id);
+        // NVS is empty: use compiled default so a freshly-flashed unit appears under the known default ID.
+        strncpy(unit_id, DEFAULT_UNIT_ID, UNIT_ID_MAX_LEN - 1);
+        unit_id[UNIT_ID_MAX_LEN - 1] = '\0';
+        ESP_LOGW(TAG, "unit_id not found in NVS - using compiled default: %s", unit_id);
+
+        // Persist the compiled default for next boot (field tools can overwrite via SET_ID).
+        esp_err_t w = write_unit_id_to_nvs(unit_id);
+        if (w != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to persist compiled default unit_id: %s", esp_err_to_name(w));
+
+            // Last-resort fallback: Generate MAC-based ID (still attempt to persist it).
+            uint8_t mac[6];
+            esp_err_t ret = esp_read_mac(mac, ESP_MAC_WIFI_STA);
+            if (ret == ESP_OK) {
+                snprintf(unit_id, UNIT_ID_MAX_LEN, "EG%02X%02X%02X", mac[3], mac[4], mac[5]);
+                ESP_LOGI(TAG, "Generated MAC-based unit ID: %s", unit_id);
+                write_unit_id_to_nvs(unit_id);
+            }
         }
     }
     
@@ -765,7 +738,6 @@ esp_err_t ble_send_notification(const char* message, bool is_response)
         return ESP_ERR_INVALID_STATE;
     }
 
-    
     notification_msg_t msg;
     strncpy(msg.message, message, MSG_BUF_LEN - 1);
     msg.message[MSG_BUF_LEN - 1] = '\0';  // Ensure null termination
@@ -1603,9 +1575,9 @@ void serial_command_task(void *arg) {
     ESP_LOGI(TAG, "  GET_ID           - Show current unit ID");
     ESP_LOGI(TAG, "  SET_STATUS <val> - Set status_reg (e.g. 0x1234 or 4660)");
     ESP_LOGI(TAG, "  GET_STATUS       - Show status_reg");
-    ESP_LOGI(TAG, "  SET_PROG <ver>   - Set prog_version string");
+    ESP_LOGI(TAG, "  SET_PROG <ver>   - (disabled) prog_version is compile-time only");
     ESP_LOGI(TAG, "  GET_PROG         - Show prog_version");
-    ESP_LOGI(TAG, "  SET <key>=<val>  - Generic set (unit_id, status_reg, prog_version, rx_silence_ms)");
+    ESP_LOGI(TAG, "  SET <key>=<val>  - Generic set (unit_id, status_reg, rx_silence_ms)");
     ESP_LOGI(TAG, "  GET <key>        - Generic get (unit_id, status_reg, prog_version, rx_silence_ms)");
     ESP_LOGI(TAG, "  LIST             - List keys in NVS namespace unit_config");
     ESP_LOGI(TAG, "  HELP             - Show this help");
@@ -1670,13 +1642,8 @@ void serial_command_task(void *arg) {
                         printf("status_reg: 0x%04X\n", (unsigned)status_reg);
                     }
                     else if (strncmp(cmd, "SET_PROG ", 9) == 0) {
-                        char *new_ver = cmd + 9;
-                        esp_err_t err = write_prog_version_to_nvs(new_ver);
-                        if (err == ESP_OK) {
-                            printf("prog_version set to: %s\n", prog_version);
-                        } else {
-                            printf("Error setting prog_version: %s\n", esp_err_to_name(err));
-                        }
+                        (void)cmd;
+                        printf("prog_version is compile-time only (SET_PROG disabled)\n");
                     }
                     else if (strcmp(cmd, "GET_PROG") == 0) {
                         printf("prog_version: %s\n", prog_version);
@@ -1723,12 +1690,8 @@ void serial_command_task(void *arg) {
                                     printf("Error setting unit ID: %s\n", esp_err_to_name(err));
                                 }
                             } else if (strcmp(key, "prog_version") == 0) {
-                                esp_err_t err = write_prog_version_to_nvs(val);
-                                if (err == ESP_OK) {
-                                    printf("prog_version set to: %s\n", prog_version);
-                                } else {
-                                    printf("Error setting prog_version: %s\n", esp_err_to_name(err));
-                                }
+                                (void)val;
+                                printf("prog_version is compile-time only (SET prog_version disabled)\n");
                             } else if (strcmp(key, "rx_silence_ms") == 0) {
                                 uint16_t v16 = 0;
                                 if (!parse_u16_flexible(val, &v16)) {
