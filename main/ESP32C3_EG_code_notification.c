@@ -1851,7 +1851,7 @@ void serial_command_task(void *arg) {
 void app_main(void) 
 {
 
-   // ESP_LOGI(TAG, "=== BLE APPLICATION STARTING ===");
+   // ESP_LOGI(TAG, "=== BLE APPLICATION app_main===");
 
     ESP_ERROR_CHECK(nvs_flash_init());
 
